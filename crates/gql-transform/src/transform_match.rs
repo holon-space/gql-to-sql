@@ -984,16 +984,24 @@ fn transform_return_item_expr<'a>(
                 .ok_or_else(|| TransformError::Internal(format!("unknown variable: {name}")))?;
             match ctx.get_kind(name) {
                 Some(VarKind::Node) => {
-                    let resolver = ctx
-                        .get_node_resolver(name)
-                        .unwrap_or(schema.default_node_resolver.as_ref());
-                    Ok(resolver.node_json_object(alias))
+                    if schema.raw_return {
+                        Ok(format!("{alias}.*"))
+                    } else {
+                        let resolver = ctx
+                            .get_node_resolver(name)
+                            .unwrap_or(schema.default_node_resolver.as_ref());
+                        Ok(resolver.node_json_object(alias))
+                    }
                 }
                 Some(VarKind::Edge) => {
-                    let resolver = ctx
-                        .get_edge_resolver(name)
-                        .unwrap_or(schema.default_edge_resolver.as_ref());
-                    Ok(resolver.edge_json_object(alias))
+                    if schema.raw_return {
+                        Ok(format!("{alias}.*"))
+                    } else {
+                        let resolver = ctx
+                            .get_edge_resolver(name)
+                            .unwrap_or(schema.default_edge_resolver.as_ref());
+                        Ok(resolver.edge_json_object(alias))
+                    }
                 }
                 Some(VarKind::Value) => Ok(alias.to_string()),
                 None => Ok(alias.to_string()),
@@ -2431,6 +2439,7 @@ mod tests {
             edges,
             default_node_resolver: Box::new(EavNodeResolver),
             default_edge_resolver: Box::new(EavEdgeResolver),
+            raw_return: false,
         };
 
         // GQL: variable-length CHILD_OF path
@@ -2521,6 +2530,7 @@ mod tests {
             edges,
             default_node_resolver: Box::new(EavNodeResolver),
             default_edge_resolver: Box::new(EavEdgeResolver),
+            raw_return: false,
         };
 
         let gql = "MATCH (root:Block)<-[:CHILD_OF*1..20]-(d:Block) \
@@ -2633,6 +2643,7 @@ mod tests {
             edges,
             default_node_resolver: Box::new(EavNodeResolver),
             default_edge_resolver: Box::new(EavEdgeResolver),
+            raw_return: false,
         };
 
         let gql =
@@ -2698,5 +2709,47 @@ mod tests {
         };
         let sql = transform_query(&query, &GraphSchema::default()).unwrap();
         assert!(sql.contains("\"n\""), "Should have column 'n': {sql}");
+    }
+
+    #[test]
+    fn test_return_star_raw() {
+        let gql = "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN *";
+        let parsed = gql_parser::parse(gql).unwrap();
+        let query = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let schema = GraphSchema {
+            raw_return: true,
+            ..GraphSchema::default()
+        };
+        let sql = transform_query(&query, &schema).unwrap();
+        assert!(sql.contains("_v0.*"), "Should have _v0.*: {sql}");
+        assert!(sql.contains("_v1.*"), "Should have _v1.*: {sql}");
+        assert!(sql.contains("_v2.*"), "Should have _v2.*: {sql}");
+        assert!(
+            !sql.contains("json_object"),
+            "Should not have json_object: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_return_var_raw() {
+        let gql = "MATCH (a:Person) RETURN a";
+        let parsed = gql_parser::parse(gql).unwrap();
+        let query = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let schema = GraphSchema {
+            raw_return: true,
+            ..GraphSchema::default()
+        };
+        let sql = transform_query(&query, &schema).unwrap();
+        assert!(sql.contains("_v0.*"), "Should have _v0.*: {sql}");
+        assert!(
+            !sql.contains("json_object"),
+            "Should not have json_object: {sql}"
+        );
     }
 }

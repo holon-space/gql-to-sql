@@ -79,6 +79,16 @@ pub trait NodeResolver: Send + Sync {
 
 // ---- Edge resolver trait ----
 
+#[derive(Debug, Clone)]
+pub struct RecursiveStep {
+    /// Expression for the next node ID (e.g., `e.target_id` or `_fk.id`)
+    pub next_node_expr: String,
+    /// FROM/JOIN clause (e.g., `JOIN edges e ON e.source_id = _vl0.node_id`)
+    pub from_clause: String,
+    /// Additional WHERE conditions (type filter, etc.)
+    pub where_conditions: Vec<String>,
+}
+
 pub trait EdgeResolver: Send + Sync {
     fn table(&self) -> &str;
 
@@ -100,6 +110,36 @@ pub trait EdgeResolver: Send + Sync {
 
     fn create_sql(&self, source_id_expr: &str, target_id_expr: &str, rel_type: &str)
         -> Vec<String>;
+
+    fn recursive_step(
+        &self,
+        cte_name: &str,
+        direction: &Direction,
+        rel_types: &[String],
+    ) -> RecursiveStep {
+        let type_filter = if !rel_types.is_empty() {
+            let types = rel_types
+                .iter()
+                .map(|t| format!("'{}'", escape_sql_string(t)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            vec![format!("e.type IN ({})", types)]
+        } else {
+            vec![]
+        };
+        match direction {
+            Direction::Left => RecursiveStep {
+                next_node_expr: "e.source_id".to_string(),
+                from_clause: format!("JOIN edges e ON e.target_id = {cte_name}.node_id"),
+                where_conditions: type_filter,
+            },
+            _ => RecursiveStep {
+                next_node_expr: "e.target_id".to_string(),
+                from_clause: format!("JOIN edges e ON e.source_id = {cte_name}.node_id"),
+                where_conditions: type_filter,
+            },
+        }
+    }
 }
 
 // ---- GraphSchema registry ----
@@ -115,6 +155,7 @@ pub struct GraphSchema {
     pub edges: HashMap<String, EdgeDef>,
     pub default_node_resolver: Box<dyn NodeResolver>,
     pub default_edge_resolver: Box<dyn EdgeResolver>,
+    pub raw_return: bool,
 }
 
 impl Default for GraphSchema {
@@ -124,6 +165,7 @@ impl Default for GraphSchema {
             edges: HashMap::new(),
             default_node_resolver: Box::new(EavNodeResolver),
             default_edge_resolver: Box::new(EavEdgeResolver),
+            raw_return: false,
         }
     }
 }
@@ -214,25 +256,55 @@ impl NodeResolver for EavNodeResolver {
 
     fn property_expr(&self, alias: &str, property: &str, prop_index: usize) -> PropertyFragment {
         let p = escape_sql_string(property);
-        let npt = format!("_npt_{alias}_{prop_index}");
         let pk = format!("_pk_{alias}_{prop_index}");
+        let npt = format!("_npt_{alias}_{prop_index}");
+        let npi = format!("_npi_{alias}_{prop_index}");
+        let npr = format!("_npr_{alias}_{prop_index}");
+        let npb = format!("_npb_{alias}_{prop_index}");
+        let npj = format!("_npj_{alias}_{prop_index}");
         PropertyFragment {
-            expr: format!("{npt}.value"),
+            expr: format!(
+                "COALESCE({npt}.value, {npi}.value, {npr}.value, {npb}.value, {npj}.value)"
+            ),
             joins: vec![
-                JoinFragment {
-                    join_type: JoinType::Inner,
-                    table: "node_props_text".to_string(),
-                    alias: npt.clone(),
-                    on_condition: format!("{npt}.node_id = {alias}.id"),
-                },
                 JoinFragment {
                     join_type: JoinType::Inner,
                     table: "property_keys".to_string(),
                     alias: pk.clone(),
-                    on_condition: format!("{npt}.key_id = {pk}.id"),
+                    on_condition: format!("{pk}.key = '{p}'"),
+                },
+                JoinFragment {
+                    join_type: JoinType::Left,
+                    table: "node_props_text".to_string(),
+                    alias: npt.clone(),
+                    on_condition: format!("{npt}.node_id = {alias}.id AND {npt}.key_id = {pk}.id"),
+                },
+                JoinFragment {
+                    join_type: JoinType::Left,
+                    table: "node_props_int".to_string(),
+                    alias: npi.clone(),
+                    on_condition: format!("{npi}.node_id = {alias}.id AND {npi}.key_id = {pk}.id"),
+                },
+                JoinFragment {
+                    join_type: JoinType::Left,
+                    table: "node_props_real".to_string(),
+                    alias: npr.clone(),
+                    on_condition: format!("{npr}.node_id = {alias}.id AND {npr}.key_id = {pk}.id"),
+                },
+                JoinFragment {
+                    join_type: JoinType::Left,
+                    table: "node_props_bool".to_string(),
+                    alias: npb.clone(),
+                    on_condition: format!("{npb}.node_id = {alias}.id AND {npb}.key_id = {pk}.id"),
+                },
+                JoinFragment {
+                    join_type: JoinType::Left,
+                    table: "node_props_json".to_string(),
+                    alias: npj.clone(),
+                    on_condition: format!("{npj}.node_id = {alias}.id AND {npj}.key_id = {pk}.id"),
                 },
             ],
-            conditions: vec![format!("{pk}.key = '{p}'")],
+            conditions: vec![],
         }
     }
 
@@ -748,6 +820,38 @@ impl EdgeResolver for ForeignKeyEdgeResolver {
             id = self.target_id_column,
         )]
     }
+
+    fn recursive_step(
+        &self,
+        cte_name: &str,
+        direction: &Direction,
+        _rel_types: &[String],
+    ) -> RecursiveStep {
+        match direction {
+            Direction::Left => {
+                // Backward: given node_id (a parent), find rows whose FK points to it
+                RecursiveStep {
+                    next_node_expr: format!("_fk.{}", self.target_id_column),
+                    from_clause: format!(
+                        "JOIN {} _fk ON _fk.{} = {}.node_id",
+                        self.fk_table, self.fk_column, cte_name
+                    ),
+                    where_conditions: vec![],
+                }
+            }
+            _ => {
+                // Forward: given node_id (in fk_table), follow fk_column to target
+                RecursiveStep {
+                    next_node_expr: format!("_fk.{}", self.fk_column),
+                    from_clause: format!(
+                        "JOIN {} _fk ON _fk.{} = {}.node_id",
+                        self.fk_table, self.target_id_column, cte_name
+                    ),
+                    where_conditions: vec![],
+                }
+            }
+        }
+    }
 }
 
 // ---- Join Table Edge Resolver ----
@@ -828,6 +932,26 @@ impl EdgeResolver for JoinTableEdgeResolver {
             "INSERT INTO {} ({}, {}) VALUES ({}, {})",
             self.join_table, self.source_column, self.target_column, source_id_expr, target_id_expr,
         )]
+    }
+
+    fn recursive_step(
+        &self,
+        cte_name: &str,
+        direction: &Direction,
+        _rel_types: &[String],
+    ) -> RecursiveStep {
+        let (src_col, tgt_col) = match direction {
+            Direction::Left => (&self.target_column, &self.source_column),
+            _ => (&self.source_column, &self.target_column),
+        };
+        RecursiveStep {
+            next_node_expr: format!("_jt.{}", tgt_col),
+            from_clause: format!(
+                "JOIN {} _jt ON _jt.{} = {}.node_id",
+                self.join_table, src_col, cte_name
+            ),
+            where_conditions: vec![],
+        }
     }
 }
 
