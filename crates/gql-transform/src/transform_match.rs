@@ -7,7 +7,8 @@ use gql_parser::{
     ReturnClause, ReturnItem, WithClause,
 };
 
-use crate::resolver::{EdgeResolver, GraphSchema, NodeResolver};
+use crate::plan;
+use crate::resolver::{EdgeResolver, GraphSchema, NodeResolver, RecursiveStep};
 use crate::sql_builder::{escape_sql_string, JoinType, SqlBuilder, WriteBuilder};
 use crate::TransformError;
 
@@ -16,6 +17,8 @@ struct TransformContext<'a> {
     var_aliases: HashMap<String, String>,
     /// Maps variable name -> variable kind
     var_kinds: HashMap<String, VarKind>,
+    /// Variable names in registration order, for RETURN * expansion
+    var_order: Vec<String>,
     alias_counter: usize,
     prop_counter: usize,
     /// Variable names in creation order, for pure-CREATE relationship references
@@ -26,6 +29,10 @@ struct TransformContext<'a> {
     node_resolvers: HashMap<String, &'a dyn NodeResolver>,
     /// Which edge resolver each edge variable uses
     edge_resolvers: HashMap<String, &'a dyn EdgeResolver>,
+    /// MATCH WHERE conditions distributed per node variable by the planning phase.
+    /// Each entry maps a variable name to the GQL AST conditions referencing that variable.
+    /// These are transformed to SQL during lowering (node pattern processing and CTE seed construction).
+    pending_node_filters: HashMap<String, Vec<&'a Expr>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -40,12 +47,14 @@ impl<'a> TransformContext<'a> {
         Self {
             var_aliases: HashMap::new(),
             var_kinds: HashMap::new(),
+            var_order: Vec::new(),
             alias_counter: 0,
             prop_counter: 0,
             created_node_order: Vec::new(),
             path_vars: HashMap::new(),
             node_resolvers: HashMap::new(),
             edge_resolvers: HashMap::new(),
+            pending_node_filters: HashMap::new(),
         }
     }
 
@@ -68,6 +77,7 @@ impl<'a> TransformContext<'a> {
         let alias = self.next_alias();
         self.var_aliases.insert(name.to_string(), alias.clone());
         self.var_kinds.insert(name.to_string(), VarKind::Node);
+        self.var_order.push(name.to_string());
         alias
     }
 
@@ -78,6 +88,7 @@ impl<'a> TransformContext<'a> {
         let alias = self.next_alias();
         self.var_aliases.insert(name.to_string(), alias.clone());
         self.var_kinds.insert(name.to_string(), VarKind::Edge);
+        self.var_order.push(name.to_string());
         alias
     }
 
@@ -98,7 +109,10 @@ impl<'a> TransformContext<'a> {
     }
 }
 
-pub fn transform_query(query: &Query, schema: &GraphSchema) -> Result<String, TransformError> {
+pub fn transform_query<'a>(
+    query: &'a Query,
+    schema: &'a GraphSchema,
+) -> Result<String, TransformError> {
     let mut ctx = TransformContext::new();
 
     let mut has_match = false;
@@ -148,7 +162,7 @@ pub fn transform_query(query: &Query, schema: &GraphSchema) -> Result<String, Tr
 }
 
 fn transform_match_return<'a>(
-    query: &Query,
+    query: &'a Query,
     ctx: &mut TransformContext<'a>,
     schema: &'a GraphSchema,
 ) -> Result<String, TransformError> {
@@ -171,7 +185,7 @@ fn transform_match_return<'a>(
 }
 
 fn transform_standalone_return<'a>(
-    query: &Query,
+    query: &'a Query,
     ctx: &mut TransformContext<'a>,
     schema: &'a GraphSchema,
 ) -> Result<String, TransformError> {
@@ -220,23 +234,41 @@ fn transform_for_clause<'a>(
     ctx.var_aliases
         .insert(f.variable.clone(), format!("{je_alias}.value"));
     ctx.var_kinds.insert(f.variable.clone(), VarKind::Value);
+    ctx.var_order.push(f.variable.clone());
     Ok(())
 }
 
 fn transform_match_clause<'a>(
     ctx: &mut TransformContext<'a>,
     builder: &mut SqlBuilder,
-    m: &MatchClause,
+    m: &'a MatchClause,
     schema: &'a GraphSchema,
 ) -> Result<(), TransformError> {
+    // Plan phase: distribute MATCH WHERE conditions to node variables.
+    // This happens BEFORE any SQL generation, so variables don't need to be
+    // registered yet — we only analyze AST references, not generate SQL.
+    let plan = plan::plan_match_clause(m);
+
+    for (var, conditions) in &plan.per_node {
+        ctx.pending_node_filters
+            .entry(var.to_string())
+            .or_default()
+            .extend(conditions);
+    }
+
+    // Lower phase: process patterns, generating SQL with all conditions available.
     for path in &m.pattern {
         transform_path(ctx, builder, path, m.optional, schema)?;
     }
 
-    if let Some(ref where_expr) = m.where_expr {
-        let sql = transform_expr(ctx, builder, where_expr, schema)?;
+    // Add general conditions (multi-variable or non-node conditions).
+    // Variables are now registered, so transform_expr can resolve them.
+    for cond in &plan.general {
+        let sql = transform_expr(ctx, builder, cond, schema)?;
         builder.add_where(&sql);
     }
+
+    ctx.pending_node_filters.clear();
 
     Ok(())
 }
@@ -253,6 +285,7 @@ fn transform_path<'a>(
     }
 
     let mut node_aliases: Vec<String> = Vec::new();
+    let mut node_patterns: Vec<&NodePattern> = Vec::new();
     let mut skip_next_node = false;
     let mut path_element_aliases: Vec<(String, VarKind)> = Vec::new();
 
@@ -265,6 +298,7 @@ fn transform_path<'a>(
                 }
                 let alias = transform_node_pattern(ctx, builder, node, optional, schema)?;
                 node_aliases.push(alias.clone());
+                node_patterns.push(node);
                 path_element_aliases.push((alias, VarKind::Node));
             }
             PathElement::Rel(rel) => {
@@ -273,6 +307,7 @@ fn transform_path<'a>(
                     "malformed path: Rel must be between two Nodes"
                 );
                 let source_alias = node_aliases[node_aliases.len() - 1].clone();
+                let source_node = node_patterns[node_patterns.len() - 1];
                 let target_node = match &path.elements[i + 1] {
                     PathElement::Node(n) => n,
                     _ => unreachable!("path must alternate Node-Rel-Node"),
@@ -284,6 +319,7 @@ fn transform_path<'a>(
                         ctx,
                         builder,
                         &source_alias,
+                        source_node,
                         rel,
                         target_node,
                         optional,
@@ -367,6 +403,7 @@ fn transform_path<'a>(
                 };
 
                 node_aliases.push(target_alias.clone());
+                node_patterns.push(target_node);
 
                 // Handle edge WHERE and property expressions
                 if let Some(ref where_expr) = rel.where_expr {
@@ -421,34 +458,57 @@ fn transform_shortest_path<'a>(
     let cte_name = format!("_sp{}", ctx.alias_counter);
     ctx.alias_counter += 1;
 
-    let (join_col, select_col) = match rel.direction {
-        Direction::Left => ("target_id", "source_id"),
-        _ => ("source_id", "target_id"),
-    };
+    let rel_type = rel.rel_types.first().map(|s| s.as_str());
+    let resolver = schema.edge_resolver(rel_type);
 
-    let type_filter = if !rel.rel_types.is_empty() {
+    let build_step_sql = |step: RecursiveStep| -> String {
+        let cycle = format!(
+            "',' || {cte_name}.visited || ',' NOT LIKE '%,' || CAST({next} AS TEXT) || ',%'",
+            next = step.next_node_expr
+        );
+        let mut conditions = vec![format!("{cte_name}.depth < {max_hops}"), cycle];
+        conditions.extend(step.where_conditions);
+
         format!(
-            " AND e.type IN ({})",
-            rel.rel_types
-                .iter()
-                .map(|t| format!("'{}'", escape_sql_string(t)))
-                .collect::<Vec<_>>()
-                .join(", ")
+            "SELECT {next}, {cte_name}.depth + 1, \
+             {cte_name}.visited || ',' || CAST({next} AS TEXT) \
+             FROM {cte_name} \
+             {from} \
+             WHERE {where_clause}",
+            next = step.next_node_expr,
+            from = step.from_clause,
+            where_clause = conditions.join(" AND "),
         )
-    } else {
-        String::new()
     };
 
+    let recursive_part = match rel.direction {
+        Direction::Both | Direction::None => {
+            let fwd = resolver.recursive_step(&cte_name, &Direction::Right, &rel.rel_types);
+            let bwd = resolver.recursive_step(&cte_name, &Direction::Left, &rel.rel_types);
+            format!("{} UNION ALL {}", build_step_sql(fwd), build_step_sql(bwd))
+        }
+        ref dir => {
+            let step = resolver.recursive_step(&cte_name, dir, &rel.rel_types);
+            build_step_sql(step)
+        }
+    };
+
+    // CTE must be self-contained — it cannot reference outer query aliases.
+    // Build seed conditions from ALL sources: inline props, node WHERE, and MATCH WHERE.
+    let label = source_node.labels.first().map(|s| s.as_str());
+    let source_table = schema.node_resolver(label).table();
+    let seed_conditions = build_seed_conditions(ctx, builder, source_node, &source_alias, schema)?;
+    let seed_where = if seed_conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", seed_conditions.join(" AND "))
+    };
     let cte_sql = format!(
         "SELECT {source_alias}.id AS node_id, 0 AS depth, \
          CAST({source_alias}.id AS TEXT) AS visited \
+         FROM {source_table} AS {source_alias}{seed_where} \
          UNION ALL \
-         SELECT e.{select_col}, {cte_name}.depth + 1, \
-         {cte_name}.visited || ',' || CAST(e.{select_col} AS TEXT) \
-         FROM {cte_name} \
-         JOIN edges e ON e.{join_col} = {cte_name}.node_id{type_filter} \
-         WHERE {cte_name}.depth < {max_hops} \
-         AND ',' || {cte_name}.visited || ',' NOT LIKE '%,' || CAST(e.{select_col} AS TEXT) || ',%'"
+         {recursive_part}"
     );
 
     builder.add_cte_recursive(&cte_name, &cte_sql);
@@ -480,10 +540,82 @@ fn transform_shortest_path<'a>(
     Ok(())
 }
 
+/// Build WHERE conditions for a CTE seed from a source node's inline properties.
+/// Uses the node's resolver to produce column filters (e.g. `_seed."id" = 'foo'`).
+fn build_seed_conditions<'a>(
+    ctx: &mut TransformContext<'a>,
+    builder: &mut SqlBuilder,
+    source_node: &NodePattern,
+    seed_alias: &str,
+    schema: &'a GraphSchema,
+) -> Result<Vec<String>, TransformError> {
+    let label = source_node.labels.first().map(|s| s.as_str());
+    let resolver = schema.node_resolver(label);
+    let source_table = resolver.table();
+    let mut conditions = Vec::new();
+
+    if let Some(ref props_expr) = source_node.properties {
+        if let Expr::Map(pairs) = props_expr.as_ref() {
+            for pair in pairs {
+                let value_sql = transform_expr(ctx, builder, &pair.value, schema)?;
+                let frag = resolver.property_filter(seed_alias, &pair.key, &value_sql, &pair.value);
+                if frag.joins.is_empty() {
+                    // Mapped nodes: simple column filters, safe inside CTE seed.
+                    for c in frag.conditions {
+                        conditions.push(c);
+                    }
+                } else {
+                    // EAV nodes: filter needs property table joins that can't go inside
+                    // the CTE seed. Convert to a self-contained subquery instead.
+                    let mut subquery_parts = vec![format!(
+                        "SELECT {seed_alias}.id FROM {source_table} AS {seed_alias}"
+                    )];
+                    for j in &frag.joins {
+                        let kw = match j.join_type {
+                            JoinType::Inner | JoinType::Cross => "JOIN",
+                            JoinType::Left => "LEFT JOIN",
+                        };
+                        subquery_parts.push(format!(
+                            " {kw} {} AS {} ON {}",
+                            j.table, j.alias, j.on_condition
+                        ));
+                    }
+                    if !frag.conditions.is_empty() {
+                        subquery_parts.push(format!(" WHERE {}", frag.conditions.join(" AND ")));
+                    }
+                    conditions.push(format!("{seed_alias}.id IN ({})", subquery_parts.join("")));
+                }
+            }
+        }
+    }
+
+    if let Some(ref where_expr) = source_node.where_expr {
+        let sql = transform_expr(ctx, builder, where_expr, schema)?;
+        conditions.push(sql);
+    }
+
+    // Include MATCH WHERE conditions assigned to this variable by the planning phase.
+    // Clone to avoid borrow conflict with the mutable ctx reference in transform_expr.
+    if let Some(ref var_name) = source_node.variable {
+        let filters: Vec<&Expr> = ctx
+            .pending_node_filters
+            .get(var_name.as_str())
+            .cloned()
+            .unwrap_or_default();
+        for filter in &filters {
+            let sql = transform_expr(ctx, builder, filter, schema)?;
+            conditions.push(sql);
+        }
+    }
+
+    Ok(conditions)
+}
+
 fn transform_varlen_segment<'a>(
     ctx: &mut TransformContext<'a>,
     builder: &mut SqlBuilder,
     source_alias: &str,
+    source_node: &NodePattern,
     rel: &RelPattern,
     target_node: &NodePattern,
     optional: bool,
@@ -496,82 +628,108 @@ fn transform_varlen_segment<'a>(
     let cte_name = format!("_vl{}", ctx.alias_counter);
     ctx.alias_counter += 1;
 
-    let type_filter = if !rel.rel_types.is_empty() {
-        format!(
-            " AND e.type IN ({})",
-            rel.rel_types
-                .iter()
-                .map(|t| format!("'{}'", escape_sql_string(t)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    } else {
-        String::new()
-    };
+    let rel_type = rel.rel_types.first().map(|s| s.as_str());
+    let resolver = schema.edge_resolver(rel_type);
 
-    let cycle_check = |col: &str| -> String {
-        format!("',' || {cte_name}.visited || ',' NOT LIKE '%,' || CAST(e.{col} AS TEXT) || ',%'")
+    // Carry source_id through the recursion so the CTE can equijoin to the
+    // source node in the outer query. Turso IVM requires all JOINs to have
+    // at least one equality condition on column references.
+    let build_step_sql = |step: RecursiveStep| -> String {
+        let cycle = format!(
+            "',' || {cte_name}.visited || ',' NOT LIKE '%,' || CAST({next} AS TEXT) || ',%'",
+            next = step.next_node_expr
+        );
+        let mut conditions = vec![format!("{cte_name}.depth < {max_hops}"), cycle];
+        conditions.extend(step.where_conditions);
+
+        format!(
+            "SELECT {next}, {cte_name}.source_id, {cte_name}.depth + 1, \
+             {cte_name}.visited || ',' || CAST({next} AS TEXT) \
+             FROM {cte_name} \
+             {from} \
+             WHERE {where_clause}",
+            next = step.next_node_expr,
+            from = step.from_clause,
+            where_clause = conditions.join(" AND "),
+        )
     };
 
     let recursive_part = match rel.direction {
         Direction::Both | Direction::None => {
-            format!(
-                "SELECT e.target_id, {cte_name}.depth + 1, \
-                 {cte_name}.visited || ',' || CAST(e.target_id AS TEXT) \
-                 FROM {cte_name} \
-                 JOIN edges e ON e.source_id = {cte_name}.node_id{type_filter} \
-                 WHERE {cte_name}.depth < {max_hops} \
-                 AND {cycle_fwd} \
-                 UNION ALL \
-                 SELECT e.source_id, {cte_name}.depth + 1, \
-                 {cte_name}.visited || ',' || CAST(e.source_id AS TEXT) \
-                 FROM {cte_name} \
-                 JOIN edges e ON e.target_id = {cte_name}.node_id{type_filter} \
-                 WHERE {cte_name}.depth < {max_hops} \
-                 AND {cycle_rev}",
-                cycle_fwd = cycle_check("target_id"),
-                cycle_rev = cycle_check("source_id"),
-            )
+            let fwd = resolver.recursive_step(&cte_name, &Direction::Right, &rel.rel_types);
+            let bwd = resolver.recursive_step(&cte_name, &Direction::Left, &rel.rel_types);
+            format!("{} UNION ALL {}", build_step_sql(fwd), build_step_sql(bwd))
         }
-        Direction::Left => {
-            format!(
-                "SELECT e.source_id, {cte_name}.depth + 1, \
-                 {cte_name}.visited || ',' || CAST(e.source_id AS TEXT) \
-                 FROM {cte_name} \
-                 JOIN edges e ON e.target_id = {cte_name}.node_id{type_filter} \
-                 WHERE {cte_name}.depth < {max_hops} \
-                 AND {cycle}",
-                cycle = cycle_check("source_id"),
-            )
-        }
-        Direction::Right => {
-            format!(
-                "SELECT e.target_id, {cte_name}.depth + 1, \
-                 {cte_name}.visited || ',' || CAST(e.target_id AS TEXT) \
-                 FROM {cte_name} \
-                 JOIN edges e ON e.source_id = {cte_name}.node_id{type_filter} \
-                 WHERE {cte_name}.depth < {max_hops} \
-                 AND {cycle}",
-                cycle = cycle_check("target_id"),
-            )
+        ref dir => {
+            let step = resolver.recursive_step(&cte_name, dir, &rel.rel_types);
+            build_step_sql(step)
         }
     };
 
+    // CTE must be self-contained — it cannot reference outer query aliases.
+    let label = source_node.labels.first().map(|s| s.as_str());
+    let source_table = schema.node_resolver(label).table();
+    let seed_conditions = build_seed_conditions(ctx, builder, source_node, source_alias, schema)?;
+    let seed_where = if seed_conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", seed_conditions.join(" AND "))
+    };
+    // Base case includes source_id = seed node's id (carried through recursion)
     let cte_sql = format!(
-        "SELECT {source_alias}.id AS node_id, 0 AS depth, \
+        "SELECT {source_alias}.id AS node_id, {source_alias}.id AS source_id, 0 AS depth, \
          CAST({source_alias}.id AS TEXT) AS visited \
+         FROM {source_table} AS {source_alias}{seed_where} \
          UNION ALL \
          {recursive_part}"
     );
 
     builder.add_cte_recursive(&cte_name, &cte_sql);
 
-    let target_alias = transform_node_pattern(ctx, builder, target_node, optional, schema)?;
+    // Turso IVM requires every JOIN to have at least one equijoin condition.
+    // Strategy:
+    //   1. JOIN the CTE to source_alias via equijoin on source_id = source.id
+    //   2. JOIN the target table to the CTE via equijoin on target.id = cte.node_id
+    //   3. Depth bounds go in WHERE (non-equijoin conditions not allowed in ON)
+    let cte_alias = format!("{cte_name}_j");
+    let jt = if optional {
+        JoinType::Left
+    } else {
+        JoinType::Inner
+    };
 
-    builder.add_where(&format!(
-        "{target_alias}.id IN (SELECT node_id FROM {cte_name} \
-         WHERE depth >= {min_hops} AND depth <= {max_hops})"
-    ));
+    // Step 1: CTE equijoins to source node already in scope
+    builder.add_join_aliased(
+        jt,
+        &cte_name,
+        &cte_alias,
+        &format!("{cte_alias}.source_id = {source_alias}.id"),
+    );
+
+    // Peek at what alias transform_node_pattern_with_on will assign.
+    let target_alias_preview = match &target_node.variable {
+        Some(name) => ctx
+            .get_alias(name)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("_v{}", ctx.alias_counter)),
+        None => format!("_v{}", ctx.alias_counter),
+    };
+
+    // Step 2: Target table equijoins to CTE
+    let target_join_on = format!("{target_alias_preview}.id = {cte_alias}.node_id");
+    let target_alias = transform_node_pattern_with_on(
+        ctx,
+        builder,
+        target_node,
+        optional,
+        schema,
+        Some(&target_join_on),
+    )?;
+    assert_eq!(target_alias, target_alias_preview);
+
+    // Step 3: Depth bounds in WHERE
+    builder.add_where(&format!("{cte_alias}.depth >= {min_hops}"));
+    builder.add_where(&format!("{cte_alias}.depth <= {max_hops}"));
 
     Ok(target_alias)
 }
@@ -604,6 +762,8 @@ fn transform_node_pattern_with_on<'a>(
     };
 
     if !is_new {
+        // Apply pending MATCH WHERE conditions even for already-registered nodes
+        apply_pending_node_filters(ctx, builder, node, schema)?;
         return Ok(alias);
     }
 
@@ -661,7 +821,30 @@ fn transform_node_pattern_with_on<'a>(
         builder.add_where(&sql);
     }
 
+    // Apply MATCH WHERE conditions assigned to this variable by the planning phase
+    apply_pending_node_filters(ctx, builder, node, schema)?;
+
     Ok(alias)
+}
+
+fn apply_pending_node_filters<'a>(
+    ctx: &mut TransformContext<'a>,
+    builder: &mut SqlBuilder,
+    node: &NodePattern,
+    schema: &'a GraphSchema,
+) -> Result<(), TransformError> {
+    if let Some(ref name) = node.variable {
+        let filters: Vec<&Expr> = ctx
+            .pending_node_filters
+            .get(name.as_str())
+            .cloned()
+            .unwrap_or_default();
+        for filter in &filters {
+            let sql = transform_expr(ctx, builder, filter, schema)?;
+            builder.add_where(&sql);
+        }
+    }
+    Ok(())
 }
 
 fn transform_return_clause<'a>(
@@ -674,10 +857,28 @@ fn transform_return_clause<'a>(
         builder.set_distinct(true);
     }
 
-    let has_aggregate = r.items.iter().any(|item| expr_contains_aggregate(&item.expr));
+    // Expand RETURN * into individual items for all bound variables
+    let is_star = r.items.len() == 1 && matches!(&r.items[0].expr, Expr::Identifier(n) if n == "*");
+    let expanded: Vec<ReturnItem>;
+    let items: &[ReturnItem] = if is_star {
+        expanded = ctx
+            .var_order
+            .iter()
+            .filter(|name| ctx.var_aliases.contains_key(name.as_str()))
+            .map(|name| ReturnItem {
+                expr: Expr::Identifier(name.clone()),
+                alias: Some(name.clone()),
+            })
+            .collect();
+        &expanded
+    } else {
+        &r.items
+    };
+
+    let has_aggregate = items.iter().any(|item| expr_contains_aggregate(&item.expr));
     let mut non_aggregate_exprs = Vec::new();
 
-    for item in &r.items {
+    for item in items {
         let expr_sql = transform_return_item_expr(ctx, builder, &item.expr, schema)?;
         let alias = return_item_alias(item);
         if has_aggregate && !expr_contains_aggregate(&item.expr) {
@@ -715,12 +916,9 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
             when_clauses,
             else_expr,
         } => {
-            operand
-                .as_ref()
-                .is_some_and(|e| expr_contains_aggregate(e))
+            operand.as_ref().is_some_and(|e| expr_contains_aggregate(e))
                 || when_clauses.iter().any(|w| {
-                    expr_contains_aggregate(&w.condition)
-                        || expr_contains_aggregate(&w.result)
+                    expr_contains_aggregate(&w.condition) || expr_contains_aggregate(&w.result)
                 })
                 || else_expr
                     .as_ref()
@@ -851,12 +1049,7 @@ fn return_item_alias(item: &ReturnItem) -> Option<String> {
         return Some(alias.clone());
     }
     match &item.expr {
-        Expr::Property { expr, name } => {
-            if let Expr::Identifier(var) = expr.as_ref() {
-                return Some(format!("{var}.{name}"));
-            }
-            None
-        }
+        Expr::Property { name, .. } => Some(name.clone()),
         _ => None,
     }
 }
@@ -1545,7 +1738,7 @@ fn transform_property_access_by_name<'a>(
 // ===== CREATE-only transforms =====
 
 fn transform_create_only<'a>(
-    query: &Query,
+    query: &'a Query,
     ctx: &mut TransformContext<'a>,
     schema: &'a GraphSchema,
 ) -> Result<String, TransformError> {
@@ -1728,7 +1921,7 @@ fn generate_relationship_create<'a>(
 // ===== MATCH + CREATE =====
 
 fn transform_match_create<'a>(
-    query: &Query,
+    query: &'a Query,
     ctx: &mut TransformContext<'a>,
     schema: &'a GraphSchema,
 ) -> Result<String, TransformError> {
@@ -1800,7 +1993,7 @@ fn transform_match_create<'a>(
 // ===== MATCH + SET =====
 
 fn transform_match_set<'a>(
-    query: &Query,
+    query: &'a Query,
     ctx: &mut TransformContext<'a>,
     schema: &'a GraphSchema,
 ) -> Result<String, TransformError> {
@@ -1880,7 +2073,7 @@ SELECT {alias}.id, (SELECT id FROM property_keys WHERE key = '{escaped_key}'), {
 // ===== MATCH + DELETE =====
 
 fn transform_match_delete<'a>(
-    query: &Query,
+    query: &'a Query,
     ctx: &mut TransformContext<'a>,
     schema: &'a GraphSchema,
 ) -> Result<String, TransformError> {
@@ -1998,22 +2191,22 @@ mod tests {
             sql.contains("Person"),
             "SQL should filter on Person label: {sql}"
         );
-        // JOIN-based property lookup
+        // JOIN-based property lookup across all typed tables
         assert!(
             sql.contains("node_props_text"),
             "SQL should join node_props_text: {sql}"
+        );
+        assert!(
+            sql.contains("node_props_int"),
+            "SQL should join node_props_int: {sql}"
         );
         assert!(
             sql.contains("property_keys"),
             "SQL should join property_keys: {sql}"
         );
         assert!(
-            !sql.contains("COALESCE"),
-            "SQL should NOT contain scalar subquery COALESCE: {sql}"
-        );
-        assert!(
-            !sql.contains("SELECT npt.value FROM"),
-            "SQL should NOT contain scalar subquery: {sql}"
+            sql.contains("COALESCE"),
+            "SQL should COALESCE across typed prop tables: {sql}"
         );
     }
 
@@ -2056,14 +2249,10 @@ mod tests {
         );
 
         let sql = transform_query(&query, &schema).unwrap();
-        // Should have two separate JOIN pairs with unique aliases
+        // Should have two separate JOIN groups with unique aliases
         assert!(
-            sql.contains("_npt__v0_0"),
-            "SQL should have first prop alias: {sql}"
-        );
-        assert!(
-            sql.contains("_npt__v0_1"),
-            "SQL should have second prop alias: {sql}"
+            sql.contains("_pk__v0_0") && sql.contains("_pk__v0_1"),
+            "SQL should have two property key aliases: {sql}"
         );
         assert!(
             sql.contains("'name'") && sql.contains("'role'"),
@@ -2189,5 +2378,325 @@ mod tests {
         // No CROSS JOIN or 1=1
         assert!(!sql.contains("1=1"), "no literal ON conditions: {sql}");
         assert!(!sql.contains("CROSS"), "no CROSS JOIN: {sql}");
+    }
+
+    #[test]
+    fn test_fk_varlen_cte_base_case_is_self_contained() {
+        use crate::resolver::*;
+
+        // Schema matching holon's: blocks table with CHILD_OF FK edge
+        let mut nodes: std::collections::HashMap<String, Box<dyn NodeResolver>> =
+            std::collections::HashMap::new();
+        nodes.insert(
+            "Block".into(),
+            Box::new(MappedNodeResolver {
+                table_name: "blocks".into(),
+                id_col: "id".into(),
+                label: "Block".into(),
+                columns: vec![
+                    ColumnMapping {
+                        property_name: "id".into(),
+                        column_name: "id".into(),
+                    },
+                    ColumnMapping {
+                        property_name: "parent_id".into(),
+                        column_name: "parent_id".into(),
+                    },
+                    ColumnMapping {
+                        property_name: "content".into(),
+                        column_name: "content".into(),
+                    },
+                ],
+            }),
+        );
+
+        let mut edges: std::collections::HashMap<String, EdgeDef> =
+            std::collections::HashMap::new();
+        edges.insert(
+            "CHILD_OF".into(),
+            EdgeDef {
+                source_label: Some("Block".into()),
+                target_label: Some("Block".into()),
+                resolver: Box::new(ForeignKeyEdgeResolver {
+                    fk_table: "blocks".into(),
+                    fk_column: "parent_id".into(),
+                    target_table: "blocks".into(),
+                    target_id_column: "id".into(),
+                }),
+            },
+        );
+
+        let schema = GraphSchema {
+            nodes,
+            edges,
+            default_node_resolver: Box::new(EavNodeResolver),
+            default_edge_resolver: Box::new(EavEdgeResolver),
+        };
+
+        // GQL: variable-length CHILD_OF path
+        let gql = "MATCH (root:Block)<-[:CHILD_OF*1..3]-(d:Block) \
+                    WHERE root.id = 'test-root-id' \
+                    RETURN d.id, d.content LIMIT 5";
+        let parsed = gql_parser::parse(gql).unwrap();
+        let query = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&query, &schema).unwrap();
+
+        // The recursive CTE base case must be self-contained — it must NOT
+        // reference outer query aliases like _v0.id without its own FROM clause.
+        // A CTE that does `SELECT _v0.id AS node_id` without FROM is invalid SQL
+        // because _v0 is defined in the outer query, not in the CTE scope.
+        // This causes Turso's actor to crash with "Actor response channel closed".
+        let cte_start = sql
+            .find("WITH RECURSIVE")
+            .expect("should have recursive CTE");
+        let cte_body_start = sql[cte_start..].find('(').unwrap() + cte_start + 1;
+        let union_pos = sql[cte_body_start..].find("UNION ALL").unwrap() + cte_body_start;
+        let base_case = &sql[cte_body_start..union_pos];
+
+        // The base case references a table alias (e.g. _v0.id). For this to be
+        // valid SQL, the alias must be defined within the CTE's own FROM clause.
+        if base_case.contains("_v") {
+            assert!(
+                base_case.to_uppercase().contains("FROM"),
+                "CTE base case references a table alias but has no FROM clause, \
+                 making it an invalid correlated CTE.\nBase case: {base_case}\nFull SQL: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fk_varlen_no_cross_join() {
+        use crate::resolver::*;
+
+        // Turso IVM requires simple column references in join conditions.
+        // Variable-length paths must NOT produce `ON 1 = 1` (cross join) —
+        // the target table must be joined via a proper column reference to the CTE.
+
+        let mut nodes: std::collections::HashMap<String, Box<dyn NodeResolver>> =
+            std::collections::HashMap::new();
+        nodes.insert(
+            "Block".into(),
+            Box::new(MappedNodeResolver {
+                table_name: "blocks".into(),
+                id_col: "id".into(),
+                label: "Block".into(),
+                columns: vec![
+                    ColumnMapping {
+                        property_name: "id".into(),
+                        column_name: "id".into(),
+                    },
+                    ColumnMapping {
+                        property_name: "parent_id".into(),
+                        column_name: "parent_id".into(),
+                    },
+                    ColumnMapping {
+                        property_name: "content".into(),
+                        column_name: "content".into(),
+                    },
+                ],
+            }),
+        );
+
+        let mut edges: std::collections::HashMap<String, EdgeDef> =
+            std::collections::HashMap::new();
+        edges.insert(
+            "CHILD_OF".into(),
+            EdgeDef {
+                source_label: Some("Block".into()),
+                target_label: Some("Block".into()),
+                resolver: Box::new(ForeignKeyEdgeResolver {
+                    fk_table: "blocks".into(),
+                    fk_column: "parent_id".into(),
+                    target_table: "blocks".into(),
+                    target_id_column: "id".into(),
+                }),
+            },
+        );
+
+        let schema = GraphSchema {
+            nodes,
+            edges,
+            default_node_resolver: Box::new(EavNodeResolver),
+            default_edge_resolver: Box::new(EavEdgeResolver),
+        };
+
+        let gql = "MATCH (root:Block)<-[:CHILD_OF*1..20]-(d:Block) \
+                    WHERE root.parent_id = 'holon-doc://test' \
+                    RETURN d.id, d.parent_id, d.content";
+        let parsed = gql_parser::parse(gql).unwrap();
+        let query = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&query, &schema).unwrap();
+
+        assert!(
+            !sql.contains("ON 1 = 1") && !sql.contains("ON 1=1"),
+            "Generated SQL must not contain cross joins (ON 1=1) — \
+             Turso IVM requires simple column references in join conditions.\n\
+             Generated SQL: {sql}"
+        );
+
+        // The target table should be joined to the CTE via a proper column reference
+        assert!(
+            sql.contains("JOIN") && sql.contains(".id = "),
+            "Target table must be joined to CTE via column reference (e.g., target.id = cte.node_id).\n\
+             Generated SQL: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_fk_varlen_multihop_cte_seed_is_self_contained() {
+        use crate::resolver::*;
+
+        // Reproduces the Main Panel pattern: (cf:Focus)-[:FOCUSES_ON]->(root:Block)<-[:CHILD_OF*1..20]-(d:Block)
+        // The CTE seed for the varlen path must reference `blocks` (root's table), NOT
+        // `current_focus` (cf's table). And conditions on `cf` must NOT leak into the CTE seed.
+
+        let mut nodes: std::collections::HashMap<String, Box<dyn NodeResolver>> =
+            std::collections::HashMap::new();
+        nodes.insert(
+            "CurrentFocus".into(),
+            Box::new(MappedNodeResolver {
+                table_name: "current_focus".into(),
+                id_col: "region".into(),
+                label: "CurrentFocus".into(),
+                columns: vec![
+                    ColumnMapping {
+                        property_name: "region".into(),
+                        column_name: "region".into(),
+                    },
+                    ColumnMapping {
+                        property_name: "block_id".into(),
+                        column_name: "block_id".into(),
+                    },
+                ],
+            }),
+        );
+        nodes.insert(
+            "Block".into(),
+            Box::new(MappedNodeResolver {
+                table_name: "blocks".into(),
+                id_col: "id".into(),
+                label: "Block".into(),
+                columns: vec![
+                    ColumnMapping {
+                        property_name: "id".into(),
+                        column_name: "id".into(),
+                    },
+                    ColumnMapping {
+                        property_name: "parent_id".into(),
+                        column_name: "parent_id".into(),
+                    },
+                    ColumnMapping {
+                        property_name: "content".into(),
+                        column_name: "content".into(),
+                    },
+                ],
+            }),
+        );
+
+        let mut edges: std::collections::HashMap<String, EdgeDef> =
+            std::collections::HashMap::new();
+        edges.insert(
+            "FOCUSES_ON".into(),
+            EdgeDef {
+                source_label: Some("CurrentFocus".into()),
+                target_label: Some("Block".into()),
+                resolver: Box::new(ForeignKeyEdgeResolver {
+                    fk_table: "current_focus".into(),
+                    fk_column: "block_id".into(),
+                    target_table: "blocks".into(),
+                    target_id_column: "parent_id".into(),
+                }),
+            },
+        );
+        edges.insert(
+            "CHILD_OF".into(),
+            EdgeDef {
+                source_label: Some("Block".into()),
+                target_label: Some("Block".into()),
+                resolver: Box::new(ForeignKeyEdgeResolver {
+                    fk_table: "blocks".into(),
+                    fk_column: "parent_id".into(),
+                    target_table: "blocks".into(),
+                    target_id_column: "id".into(),
+                }),
+            },
+        );
+
+        let schema = GraphSchema {
+            nodes,
+            edges,
+            default_node_resolver: Box::new(EavNodeResolver),
+            default_edge_resolver: Box::new(EavEdgeResolver),
+        };
+
+        let gql =
+            "MATCH (cf:CurrentFocus)-[:FOCUSES_ON]->(root:Block)<-[:CHILD_OF*1..20]-(d:Block) \
+                    WHERE cf.region = 'main' \
+                    RETURN d.id, d.parent_id, d.content";
+        let parsed = gql_parser::parse(gql).unwrap();
+        let query = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&query, &schema).unwrap();
+        // CTE seed must use `blocks` (root's table), not `current_focus` (cf's table)
+        let cte_start = sql
+            .find("WITH RECURSIVE")
+            .expect("should have recursive CTE");
+        let cte_body_start = sql[cte_start..].find('(').unwrap() + cte_start + 1;
+        let union_pos = sql[cte_body_start..].find("UNION ALL").unwrap() + cte_body_start;
+        let base_case = &sql[cte_body_start..union_pos];
+
+        assert!(
+            base_case.contains("FROM blocks"),
+            "CTE seed must use the varlen source node's table ('blocks'), \
+             not the preceding node's table.\nBase case: {base_case}\nFull SQL: {sql}"
+        );
+
+        // cf.region condition must NOT appear in CTE seed (it belongs to the outer query)
+        assert!(
+            !base_case.contains("region"),
+            "CTE seed must not contain conditions from other nodes (cf.region).\n\
+             Base case: {base_case}\nFull SQL: {sql}"
+        );
+
+        // No cross joins
+        assert!(
+            !sql.contains("ON 1 = 1") && !sql.contains("ON 1=1"),
+            "No cross joins allowed.\nGenerated SQL: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_return_star() {
+        let gql = "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN *";
+        let parsed = gql_parser::parse(gql).unwrap();
+        let query = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&query, &GraphSchema::default()).unwrap();
+        // All three variables should appear as aliased columns
+        assert!(sql.contains("\"a\""), "Should have column 'a': {sql}");
+        assert!(sql.contains("\"r\""), "Should have column 'r': {sql}");
+        assert!(sql.contains("\"b\""), "Should have column 'b': {sql}");
+    }
+
+    #[test]
+    fn test_return_star_nodes_only() {
+        let gql = "MATCH (n:Person) RETURN *";
+        let parsed = gql_parser::parse(gql).unwrap();
+        let query = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&query, &GraphSchema::default()).unwrap();
+        assert!(sql.contains("\"n\""), "Should have column 'n': {sql}");
     }
 }
