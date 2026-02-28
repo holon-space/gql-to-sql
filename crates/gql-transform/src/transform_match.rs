@@ -257,8 +257,12 @@ fn transform_match_clause<'a>(
     }
 
     // Lower phase: process patterns, generating SQL with all conditions available.
-    for path in &m.pattern {
-        transform_path(ctx, builder, path, m.optional, schema)?;
+    // Bridge conditions from the plan are passed to later paths so they can be
+    // used as JOIN ON conditions instead of producing cross-joins.
+    for (i, path) in m.pattern.iter().enumerate() {
+        let empty = Vec::new();
+        let bridges = plan.bridges.get(&i).unwrap_or(&empty);
+        transform_path(ctx, builder, path, m.optional, schema, bridges)?;
     }
 
     // Add general conditions (multi-variable or non-node conditions).
@@ -279,6 +283,7 @@ fn transform_path<'a>(
     path: &Path,
     optional: bool,
     schema: &'a GraphSchema,
+    bridge_conditions: &[&'a Expr],
 ) -> Result<(), TransformError> {
     if path.path_type != PathType::Normal {
         return transform_shortest_path(ctx, builder, path, schema);
@@ -288,6 +293,7 @@ fn transform_path<'a>(
     let mut node_patterns: Vec<&NodePattern> = Vec::new();
     let mut skip_next_node = false;
     let mut path_element_aliases: Vec<(String, VarKind)> = Vec::new();
+    let mut is_first_node = true;
 
     for (i, element) in path.elements.iter().enumerate() {
         match element {
@@ -296,7 +302,15 @@ fn transform_path<'a>(
                     skip_next_node = false;
                     continue;
                 }
-                let alias = transform_node_pattern(ctx, builder, node, optional, schema)?;
+                // For the first node of a path, pass bridge conditions so it
+                // can use them as JOIN ON instead of cross-joining.
+                let bridges = if is_first_node {
+                    is_first_node = false;
+                    bridge_conditions
+                } else {
+                    &[]
+                };
+                let alias = transform_node_pattern(ctx, builder, node, optional, schema, bridges)?;
                 node_aliases.push(alias.clone());
                 node_patterns.push(node);
                 path_element_aliases.push((alias, VarKind::Node));
@@ -393,6 +407,7 @@ fn transform_path<'a>(
                         optional,
                         schema,
                         target_on.as_deref(),
+                        &[],
                     )?
                 } else {
                     let a = ctx.get_alias(target_alias_name).unwrap().to_string();
@@ -449,8 +464,8 @@ fn transform_shortest_path<'a>(
         _ => unreachable!(),
     };
 
-    let source_alias = transform_node_pattern(ctx, builder, source_node, false, schema)?;
-    let target_alias = transform_node_pattern(ctx, builder, target_node, false, schema)?;
+    let source_alias = transform_node_pattern(ctx, builder, source_node, false, schema, &[])?;
+    let target_alias = transform_node_pattern(ctx, builder, target_node, false, schema, &[])?;
 
     let min_hops = rel.varlen.as_ref().and_then(|v| v.min_hops).unwrap_or(1) as i64;
     let max_hops = rel.varlen.as_ref().and_then(|v| v.max_hops).unwrap_or(10) as i64;
@@ -724,6 +739,7 @@ fn transform_varlen_segment<'a>(
         optional,
         schema,
         Some(&target_join_on),
+        &[],
     )?;
     assert_eq!(target_alias, target_alias_preview);
 
@@ -740,8 +756,17 @@ fn transform_node_pattern<'a>(
     node: &NodePattern,
     optional: bool,
     schema: &'a GraphSchema,
+    bridge_conditions: &[&'a Expr],
 ) -> Result<String, TransformError> {
-    transform_node_pattern_with_on(ctx, builder, node, optional, schema, None)
+    transform_node_pattern_with_on(
+        ctx,
+        builder,
+        node,
+        optional,
+        schema,
+        None,
+        bridge_conditions,
+    )
 }
 
 fn transform_node_pattern_with_on<'a>(
@@ -751,6 +776,7 @@ fn transform_node_pattern_with_on<'a>(
     optional: bool,
     schema: &'a GraphSchema,
     join_on: Option<&str>,
+    bridge_conditions: &[&'a Expr],
 ) -> Result<String, TransformError> {
     let (alias, is_new) = match &node.variable {
         Some(name) => {
@@ -785,6 +811,21 @@ fn transform_node_pattern_with_on<'a>(
             JoinType::Inner
         };
         builder.add_join_aliased(jt, table, &alias, on);
+    } else if !bridge_conditions.is_empty() {
+        // Comma-separated patterns: use bridge conditions as the JOIN ON
+        // instead of a cross-join. The node is registered at this point so
+        // transform_expr can resolve its alias.
+        let mut on_parts = Vec::new();
+        for cond in bridge_conditions {
+            on_parts.push(transform_expr(ctx, builder, cond, schema)?);
+        }
+        let on = on_parts.join(" AND ");
+        let jt = if optional {
+            JoinType::Left
+        } else {
+            JoinType::Inner
+        };
+        builder.add_join_aliased(jt, table, &alias, &on);
     } else if optional {
         builder.add_join_aliased(JoinType::Left, table, &alias, "1=1");
     } else {
@@ -1093,7 +1134,9 @@ fn transform_expr<'a>(
             let r = transform_expr(ctx, builder, right, schema)?;
             let op_str = match op {
                 BinaryOp::And => "AND",
-                BinaryOp::Or => "OR",
+                BinaryOp::Or => {
+                    return Ok(format!("({l} OR {r})"));
+                }
                 BinaryOp::Xor => {
                     return Ok(format!("(({l}) OR ({r})) AND NOT (({l}) AND ({r}))"));
                 }
@@ -1582,7 +1625,9 @@ fn transform_list_comp_expr<'a>(
                 BinaryOp::Lte => "<=",
                 BinaryOp::Gte => ">=",
                 BinaryOp::And => "AND",
-                BinaryOp::Or => "OR",
+                BinaryOp::Or => {
+                    return Ok(format!("({l} OR {r})"));
+                }
                 _ => {
                     return Err(TransformError::UnsupportedExpr(format!(
                         "operator {op:?} in list comprehension"
@@ -2750,6 +2795,208 @@ mod tests {
         assert!(
             !sql.contains("json_object"),
             "Should not have json_object: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_or_precedence_in_where() {
+        use crate::resolver::*;
+
+        let mut nodes: std::collections::HashMap<String, Box<dyn NodeResolver>> =
+            std::collections::HashMap::new();
+        nodes.insert(
+            "Block".into(),
+            Box::new(MappedNodeResolver {
+                table_name: "blocks".into(),
+                id_col: "id".into(),
+                label: "Block".into(),
+                columns: vec![
+                    ColumnMapping {
+                        property_name: "id".into(),
+                        column_name: "id".into(),
+                    },
+                    ColumnMapping {
+                        property_name: "parent_id".into(),
+                        column_name: "parent_id".into(),
+                    },
+                ],
+            }),
+        );
+
+        let schema = GraphSchema {
+            nodes,
+            edges: std::collections::HashMap::new(),
+            default_node_resolver: Box::new(EavNodeResolver),
+            default_edge_resolver: Box::new(EavEdgeResolver),
+            raw_return: true,
+        };
+
+        let gql = "MATCH (b:Block) WHERE b.id = 'x' AND (b.parent_id = 'a' OR b.parent_id = 'b') RETURN b";
+        let parsed = gql_parser::parse(gql).unwrap();
+        let query = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&query, &schema).unwrap();
+
+        // The OR must be parenthesised so AND doesn't bind tighter
+        assert!(
+            sql.contains("(_v0.\"parent_id\" = 'a' OR _v0.\"parent_id\" = 'b')"),
+            "OR expression must be wrapped in parens.\nGenerated SQL: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_comma_pattern_bridge_join() {
+        use crate::resolver::*;
+
+        let mut nodes: std::collections::HashMap<String, Box<dyn NodeResolver>> =
+            std::collections::HashMap::new();
+        nodes.insert(
+            "CurrentFocus".into(),
+            Box::new(MappedNodeResolver {
+                table_name: "current_focus".into(),
+                id_col: "region".into(),
+                label: "CurrentFocus".into(),
+                columns: vec![
+                    ColumnMapping {
+                        property_name: "region".into(),
+                        column_name: "region".into(),
+                    },
+                    ColumnMapping {
+                        property_name: "block_id".into(),
+                        column_name: "block_id".into(),
+                    },
+                ],
+            }),
+        );
+        nodes.insert(
+            "Block".into(),
+            Box::new(MappedNodeResolver {
+                table_name: "blocks".into(),
+                id_col: "id".into(),
+                label: "Block".into(),
+                columns: vec![
+                    ColumnMapping {
+                        property_name: "id".into(),
+                        column_name: "id".into(),
+                    },
+                    ColumnMapping {
+                        property_name: "parent_id".into(),
+                        column_name: "parent_id".into(),
+                    },
+                ],
+            }),
+        );
+
+        let schema = GraphSchema {
+            nodes,
+            edges: std::collections::HashMap::new(),
+            default_node_resolver: Box::new(EavNodeResolver),
+            default_edge_resolver: Box::new(EavEdgeResolver),
+            raw_return: true,
+        };
+
+        // Two comma-separated patterns with a cross-variable equality in WHERE
+        let gql = "MATCH (cf:CurrentFocus), (root:Block) \
+                    WHERE cf.region = 'main' AND root.parent_id = cf.block_id \
+                    RETURN root";
+        let parsed = gql_parser::parse(gql).unwrap();
+        let query = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&query, &schema).unwrap();
+
+        // Must NOT have a cross join (ON 1=1)
+        assert!(
+            !sql.contains("1=1") && !sql.contains("1 = 1"),
+            "Comma patterns with bridge conditions must not produce cross joins.\nGenerated SQL: {sql}"
+        );
+        // The bridge condition should be in the JOIN ON
+        assert!(
+            sql.contains("JOIN blocks AS _v1 ON _v1.\"parent_id\" = _v0.\"block_id\""),
+            "Bridge equality should become the JOIN ON condition.\nGenerated SQL: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_comma_pattern_bridge_with_or() {
+        use crate::resolver::*;
+
+        let mut nodes: std::collections::HashMap<String, Box<dyn NodeResolver>> =
+            std::collections::HashMap::new();
+        nodes.insert(
+            "CurrentFocus".into(),
+            Box::new(MappedNodeResolver {
+                table_name: "current_focus".into(),
+                id_col: "region".into(),
+                label: "CurrentFocus".into(),
+                columns: vec![
+                    ColumnMapping {
+                        property_name: "region".into(),
+                        column_name: "region".into(),
+                    },
+                    ColumnMapping {
+                        property_name: "block_id".into(),
+                        column_name: "block_id".into(),
+                    },
+                ],
+            }),
+        );
+        nodes.insert(
+            "Block".into(),
+            Box::new(MappedNodeResolver {
+                table_name: "blocks".into(),
+                id_col: "id".into(),
+                label: "Block".into(),
+                columns: vec![
+                    ColumnMapping {
+                        property_name: "id".into(),
+                        column_name: "id".into(),
+                    },
+                    ColumnMapping {
+                        property_name: "parent_id".into(),
+                        column_name: "parent_id".into(),
+                    },
+                ],
+            }),
+        );
+
+        let schema = GraphSchema {
+            nodes,
+            edges: std::collections::HashMap::new(),
+            default_node_resolver: Box::new(EavNodeResolver),
+            default_edge_resolver: Box::new(EavEdgeResolver),
+            raw_return: true,
+        };
+
+        // The exact query from the handoff doc: OR condition bridges two patterns
+        let gql = "MATCH (cf:CurrentFocus), (root:Block) \
+                    WHERE cf.region = 'main' \
+                    AND (root.parent_id = cf.block_id OR root.id = cf.block_id) \
+                    RETURN root";
+        let parsed = gql_parser::parse(gql).unwrap();
+        let query = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&query, &schema).unwrap();
+
+        // Must NOT have a cross join
+        assert!(
+            !sql.contains("1=1") && !sql.contains("1 = 1"),
+            "Comma patterns with OR bridge must not produce cross joins.\nGenerated SQL: {sql}"
+        );
+        // The OR must be parenthesised
+        assert!(
+            sql.contains(" OR "),
+            "Should contain OR condition.\nGenerated SQL: {sql}"
+        );
+        // The bridge (OR) should be in JOIN ON, not in WHERE
+        assert!(
+            sql.contains("JOIN blocks AS _v1 ON"),
+            "Bridge OR should be in JOIN ON.\nGenerated SQL: {sql}"
         );
     }
 }
