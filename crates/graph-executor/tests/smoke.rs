@@ -1,6 +1,53 @@
 use gql_transform::resolver::{
     ColumnMapping, EdgeDef, ForeignKeyEdgeResolver, JoinTableEdgeResolver, MappedNodeResolver,
 };
+
+fn setup_block_hierarchy() -> graph_executor::GqlExecutor {
+    let mut exec = GqlExecutor::new_in_memory().unwrap();
+
+    exec.connection()
+        .execute_batch(
+            "CREATE TABLE blocks (id TEXT PRIMARY KEY, content TEXT, parent_id TEXT REFERENCES blocks(id));
+             INSERT INTO blocks VALUES ('root', 'Root block', NULL);
+             INSERT INTO blocks VALUES ('mid',  'Middle block', 'root');
+             INSERT INTO blocks VALUES ('leaf', 'Leaf block', 'mid');",
+        )
+        .unwrap();
+
+    exec.register_node(
+        "Block",
+        Box::new(MappedNodeResolver {
+            table_name: "blocks".to_string(),
+            id_col: "id".to_string(),
+            label: "Block".to_string(),
+            columns: vec![
+                ColumnMapping {
+                    property_name: "content".to_string(),
+                    column_name: "content".to_string(),
+                },
+                ColumnMapping {
+                    property_name: "parent_id".to_string(),
+                    column_name: "parent_id".to_string(),
+                },
+            ],
+        }),
+    );
+    exec.register_edge(
+        "CHILD_OF",
+        EdgeDef {
+            source_label: Some("Block".to_string()),
+            target_label: Some("Block".to_string()),
+            resolver: Box::new(ForeignKeyEdgeResolver {
+                fk_table: "blocks".to_string(),
+                fk_column: "parent_id".to_string(),
+                target_table: "blocks".to_string(),
+                target_id_column: "id".to_string(),
+            }),
+        },
+    );
+
+    exec
+}
 use graph_executor::{GqlExecutor, GqlResult};
 
 #[test]
@@ -479,9 +526,7 @@ fn test_cross_structure_fk_traversal() {
 
     // Filtered traversal
     let result = exec
-        .execute(
-            "MATCH (t:Task)-[:ASSIGNED_TO]->(p:Person) WHERE p.name = 'Alice' RETURN t.title",
-        )
+        .execute("MATCH (t:Task)-[:ASSIGNED_TO]->(p:Person) WHERE p.name = 'Alice' RETURN t.title")
         .unwrap();
     match &result {
         GqlResult::Rows { rows, .. } => {
@@ -497,20 +542,13 @@ fn test_cross_structure_fk_traversal() {
 
     // Aggregation across structures
     let result = exec
-        .execute(
-            "MATCH (t:Task)-[:ASSIGNED_TO]->(p:Person) RETURN p.name, count(t) AS task_count",
-        )
+        .execute("MATCH (t:Task)-[:ASSIGNED_TO]->(p:Person) RETURN p.name, count(t) AS task_count")
         .unwrap();
     match &result {
         GqlResult::Rows { rows, .. } => {
             let mut pairs: Vec<(String, i64)> = rows
                 .iter()
-                .map(|r| {
-                    (
-                        r[0].as_str().unwrap().to_string(),
-                        r[1].as_i64().unwrap(),
-                    )
-                })
+                .map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_i64().unwrap()))
                 .collect();
             pairs.sort();
             assert_eq!(
@@ -620,18 +658,114 @@ fn test_cross_structure_join_table_traversal() {
         GqlResult::Rows { rows, .. } => {
             let mut pairs: Vec<(String, i64)> = rows
                 .iter()
-                .map(|r| {
-                    (
-                        r[0].as_str().unwrap().to_string(),
-                        r[1].as_i64().unwrap(),
-                    )
-                })
+                .map(|r| (r[0].as_str().unwrap().to_string(), r[1].as_i64().unwrap()))
                 .collect();
             pairs.sort();
             assert_eq!(
                 pairs,
                 vec![("Alice".to_string(), 2), ("Bob".to_string(), 1)]
             );
+        }
+        other => panic!("Expected Rows, got: {other:?}"),
+    }
+}
+
+// ===== FK variable-length path tests =====
+
+#[test]
+fn test_fk_varlen_forward_walk_up_parents() {
+    let exec = setup_block_hierarchy();
+
+    // leaf -[:CHILD_OF*1..5]-> should walk up: leaf→mid (parent_id), mid→root (parent_id)
+    let result = exec
+        .execute("MATCH (a:Block {id: 'leaf'})-[:CHILD_OF*1..5]->(b:Block) RETURN b.id")
+        .unwrap();
+    match &result {
+        GqlResult::Rows { rows, .. } => {
+            let mut ids: Vec<String> = rows
+                .iter()
+                .map(|r| r[0].as_str().unwrap().to_string())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, vec!["mid", "root"]);
+        }
+        other => panic!("Expected Rows, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_fk_varlen_backward_walk_down_descendants() {
+    let exec = setup_block_hierarchy();
+
+    // root <-[:CHILD_OF*1..10]- should find children/descendants: mid, leaf
+    let result = exec
+        .execute("MATCH (a:Block {id: 'root'})<-[:CHILD_OF*1..10]-(b:Block) RETURN b.id")
+        .unwrap();
+    match &result {
+        GqlResult::Rows { rows, .. } => {
+            let mut ids: Vec<String> = rows
+                .iter()
+                .map(|r| r[0].as_str().unwrap().to_string())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, vec!["leaf", "mid"]);
+        }
+        other => panic!("Expected Rows, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_fk_varlen_cycle_detection() {
+    let exec = setup_block_hierarchy();
+
+    // Create a cycle: root -> mid -> leaf -> root
+    exec.connection()
+        .execute("UPDATE blocks SET parent_id = 'leaf' WHERE id = 'root'", [])
+        .unwrap();
+
+    // Should terminate and not loop forever
+    let result = exec
+        .execute("MATCH (a:Block {id: 'leaf'})-[:CHILD_OF*1..10]->(b:Block) RETURN b.id")
+        .unwrap();
+    match &result {
+        GqlResult::Rows { rows, .. } => {
+            let mut ids: Vec<String> = rows
+                .iter()
+                .map(|r| r[0].as_str().unwrap().to_string())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, vec!["mid", "root"]);
+        }
+        other => panic!("Expected Rows, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_eav_varlen_still_works() {
+    let exec = GqlExecutor::new_in_memory().unwrap();
+    exec.execute("CREATE (a:Person {name: 'Alice'})").unwrap();
+    exec.execute("CREATE (b:Person {name: 'Bob'})").unwrap();
+    exec.execute("CREATE (c:Person {name: 'Charlie'})").unwrap();
+    exec.execute(
+        "MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b)",
+    )
+    .unwrap();
+    exec.execute(
+        "MATCH (b:Person {name: 'Bob'}), (c:Person {name: 'Charlie'}) CREATE (b)-[:KNOWS]->(c)",
+    )
+    .unwrap();
+
+    let result = exec
+        .execute("MATCH (a:Person {name: 'Alice'})-[:KNOWS*1..3]->(b:Person) RETURN b.name")
+        .unwrap();
+    match &result {
+        GqlResult::Rows { rows, .. } => {
+            let mut names: Vec<String> = rows
+                .iter()
+                .map(|r| r[0].as_str().unwrap().to_string())
+                .collect();
+            names.sort();
+            assert_eq!(names, vec!["Bob", "Charlie"]);
         }
         other => panic!("Expected Rows, got: {other:?}"),
     }

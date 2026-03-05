@@ -706,7 +706,8 @@ fn transform_varlen_segment<'a>(
     //   1. JOIN the CTE to source_alias via equijoin on source_id = source.id
     //   2. JOIN the target table to the CTE via equijoin on target.id = cte.node_id
     //   3. Depth bounds go in WHERE (non-equijoin conditions not allowed in ON)
-    let cte_alias = format!("{cte_name}_j");
+    // Turso IVM can't resolve columns through CTE aliases, so use the CTE name directly.
+    let cte_alias = cte_name.clone();
     let jt = if optional {
         JoinType::Left
     } else {
@@ -714,10 +715,9 @@ fn transform_varlen_segment<'a>(
     };
 
     // Step 1: CTE equijoins to source node already in scope
-    builder.add_join_aliased(
+    builder.add_join(
         jt,
         &cte_name,
-        &cte_alias,
         &format!("{cte_alias}.source_id = {source_alias}.id"),
     );
 

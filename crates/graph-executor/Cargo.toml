@@ -9,3 +9,7 @@ gql-parser = { path = "../gql-parser" }
 gql-transform = { path = "../gql-transform" }
 rusqlite = { version = "0.31", features = ["bundled", "functions"] }
 serde_json = "1"
+
+[dev-dependencies]
+turso = { path = "/Users/martin/Workspaces/bigdata/turso/bindings/rust", default-features = false }
+tokio = { version = "1", features = ["rt", "macros"] }

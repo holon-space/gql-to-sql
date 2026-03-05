@@ -1,3 +1,4 @@
+pub mod plan;
 pub mod resolver;
 pub mod sql_builder;
 pub mod transform_match;
