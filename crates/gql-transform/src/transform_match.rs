@@ -573,7 +573,7 @@ fn build_seed_conditions<'a>(
         if let Expr::Map(pairs) = props_expr.as_ref() {
             for pair in pairs {
                 let value_sql = transform_expr(ctx, builder, &pair.value, schema)?;
-                let frag = resolver.property_filter(seed_alias, &pair.key, &value_sql, &pair.value);
+                let frag = resolver.property_filter(seed_alias, &pair.key, &value_sql, &pair.value)?;
                 if frag.joins.is_empty() {
                     // Mapped nodes: simple column filters, safe inside CTE seed.
                     for c in frag.conditions {
@@ -846,7 +846,7 @@ fn transform_node_pattern_with_on<'a>(
         if let Expr::Map(pairs) = props_expr.as_ref() {
             for pair in pairs {
                 let value_sql = transform_expr(ctx, builder, &pair.value, schema)?;
-                let frag = resolver.property_filter(&alias, &pair.key, &value_sql, &pair.value);
+                let frag = resolver.property_filter(&alias, &pair.key, &value_sql, &pair.value)?;
                 for j in frag.joins {
                     builder.add_join_aliased(j.join_type, &j.table, &j.alias, &j.on_condition);
                 }
@@ -1130,6 +1130,34 @@ fn transform_expr<'a>(
         }
 
         Expr::BinaryOp { op, left, right } => {
+            // Patch 4: `<x> IN b.<prop>` where `<prop>` is a multi-valued
+            // property → emit an index-friendly EXISTS against the inverted
+            // index instead of `<x> IN (<aggregate>)` + json_each.
+            if matches!(op, BinaryOp::In) {
+                if let Expr::Property {
+                    expr: rhs_obj,
+                    name: prop_name,
+                } = right.as_ref()
+                {
+                    if let Expr::Identifier(var_name) = rhs_obj.as_ref() {
+                        if let Some(alias) = ctx.get_alias(var_name) {
+                            let alias = alias.to_string();
+                            let resolver = ctx
+                                .get_node_resolver(var_name)
+                                .unwrap_or(schema.default_node_resolver.as_ref());
+                            if resolver.is_multi_value_property(prop_name) {
+                                let member_sql =
+                                    transform_expr(ctx, builder, left, schema)?;
+                                return resolver.multi_value_membership_expr(
+                                    &alias,
+                                    prop_name,
+                                    &member_sql,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             let l = transform_expr(ctx, builder, left, schema)?;
             let r = transform_expr(ctx, builder, right, schema)?;
             let op_str = match op {
@@ -1441,9 +1469,9 @@ fn transform_expr<'a>(
                 let sql = transform_expr(ctx, builder, prop_expr, schema)?;
                 Ok(format!("{sql} IS NOT NULL"))
             }
-            ExistsExpr::Pattern(_) => Err(TransformError::UnsupportedExpr(
-                "EXISTS pattern".to_string(),
-            )),
+            ExistsExpr::Pattern { paths, where_expr } => {
+                transform_exists_subquery(ctx, paths, where_expr.as_deref(), schema)
+            }
         },
 
         Expr::ListComprehension {
@@ -1705,7 +1733,7 @@ fn transform_property_access<'a>(
         let resolver = ctx
             .get_node_resolver(&var_name)
             .unwrap_or(schema.default_node_resolver.as_ref());
-        return Ok(resolver.nested_property_expr(alias, &json_key, &json_path));
+        return resolver.nested_property_expr(alias, &json_key, &json_path);
     }
 
     // Subscript-then-property: n['metadata'].name
@@ -1730,7 +1758,7 @@ fn transform_property_access<'a>(
                 let resolver = ctx
                     .get_node_resolver(var_name)
                     .unwrap_or(schema.default_node_resolver.as_ref());
-                return Ok(resolver.nested_property_expr(alias, sub_key, &json_path));
+                return resolver.nested_property_expr(alias, sub_key, &json_path);
             }
         }
     }
@@ -1764,7 +1792,7 @@ fn transform_property_access<'a>(
         let resolver = ctx
             .get_node_resolver(&var_name)
             .unwrap_or(schema.default_node_resolver.as_ref());
-        resolver.property_expr(&alias, prop_name, prop_index)
+        resolver.property_expr(&alias, prop_name, prop_index)?
     };
 
     for j in &frag.joins {
@@ -1786,6 +1814,298 @@ fn transform_property_access_by_name<'a>(
 ) -> Result<String, TransformError> {
     let ident = Expr::Identifier(var_name.to_string());
     transform_property_access(ctx, builder, &ident, prop_name, schema)
+}
+
+/// Patch 2: lower `EXISTS { <pattern> [WHERE <expr>] }` to a correlated SQL
+/// subquery. The first node of the inner pattern is typically a variable
+/// already bound in the outer scope (e.g. `(b)` in
+/// `EXISTS { (b)-[:e]->(x) }`); the resulting SQL references the outer alias
+/// to express the correlation.
+///
+/// The implementation builds a fresh `SqlBuilder` for the inner SELECT and a
+/// child `TransformContext` that:
+///   - inherits outer aliases / resolvers (so correlated names resolve to
+///     the outer alias),
+///   - **clears `pending_node_filters`** — outer's MATCH WHERE has already
+///     been applied to the outer query and re-applying it inside the
+///     subquery would duplicate predicates.
+///
+/// Walks the pattern linearly. The first edge JOIN is *promoted* to the
+/// inner FROM (because `SqlBuilder.build()` only emits joins when a FROM is
+/// set). Subsequent edges and the target node are added as ordinary JOINs.
+fn transform_exists_subquery<'a>(
+    outer_ctx: &TransformContext<'a>,
+    paths: &[Path],
+    inner_where: Option<&Expr>,
+    schema: &'a GraphSchema,
+) -> Result<String, TransformError> {
+    if paths.len() != 1 {
+        return Err(TransformError::UnsupportedExpr(
+            "EXISTS with multiple comma-separated patterns".to_string(),
+        ));
+    }
+    let path = &paths[0];
+
+    // Build a child context that inherits outer scope.
+    let mut child = TransformContext::new();
+    child.alias_counter = outer_ctx.alias_counter + 1;
+    child.prop_counter = outer_ctx.prop_counter + 1000;
+    for (var, alias) in &outer_ctx.var_aliases {
+        child.var_aliases.insert(var.clone(), alias.clone());
+    }
+    for (var, kind) in &outer_ctx.var_kinds {
+        child.var_kinds.insert(var.clone(), *kind);
+    }
+    for (var, resolver) in &outer_ctx.node_resolvers {
+        child.node_resolvers.insert(var.clone(), *resolver);
+    }
+    for (var, resolver) in &outer_ctx.edge_resolvers {
+        child.edge_resolvers.insert(var.clone(), *resolver);
+    }
+    // pending_node_filters intentionally empty — outer's filters belong to the
+    // outer WHERE only.
+
+    let mut inner = SqlBuilder::new();
+    inner.add_select("1");
+
+    // Walk the path. First element must be a Node; subsequent elements
+    // alternate Rel/Node.
+    let mut elements = path.elements.iter();
+    let first = elements.next().ok_or_else(|| {
+        TransformError::Internal("EXISTS pattern with empty path".to_string())
+    })?;
+    let first_node = match first {
+        PathElement::Node(n) => n,
+        PathElement::Rel(_) => {
+            return Err(TransformError::Internal(
+                "EXISTS pattern must start with a node".to_string(),
+            ))
+        }
+    };
+
+    let mut current_alias: String;
+    let mut current_resolver: &dyn NodeResolver;
+    let first_var_name = first_node.variable.clone().unwrap_or_default();
+    let first_already_outer = !first_var_name.is_empty()
+        && outer_ctx.var_aliases.contains_key(&first_var_name);
+
+    if first_already_outer {
+        // Correlated: reuse the outer alias; do NOT emit FROM. The first edge
+        // JOIN will provide the FROM via promotion.
+        current_alias = outer_ctx.var_aliases[&first_var_name].clone();
+        current_resolver = *outer_ctx
+            .node_resolvers
+            .get(&first_var_name)
+            .ok_or_else(|| {
+                TransformError::Internal(format!(
+                    "outer variable '{first_var_name}' has no registered node resolver"
+                ))
+            })?;
+    } else {
+        // Uncorrelated: emit FROM <table> <alias>. This handles the unusual
+        // case `EXISTS { (x:foo) WHERE x.k = b.k }`.
+        let label = first_node.labels.first().map(|s| s.as_str());
+        current_resolver = schema.node_resolver(label);
+        let alias = if first_var_name.is_empty() {
+            child.next_alias()
+        } else {
+            child.register_node(&first_var_name)
+        };
+        if !first_var_name.is_empty() {
+            child
+                .node_resolvers
+                .insert(first_var_name.clone(), current_resolver);
+        }
+        inner.set_from_aliased(current_resolver.table(), &alias);
+        // Apply node label/properties/where on the FROM node.
+        apply_node_filters_to_inner(
+            &mut child,
+            &mut inner,
+            first_node,
+            current_resolver,
+            &alias,
+            schema,
+        )?;
+        current_alias = alias;
+    }
+
+    // Walk Rel/Node pairs.
+    while let Some(el) = elements.next() {
+        let rel = match el {
+            PathElement::Rel(r) => r,
+            PathElement::Node(_) => {
+                return Err(TransformError::Internal(
+                    "malformed EXISTS path: two nodes in a row".to_string(),
+                ));
+            }
+        };
+        let target_node = match elements.next() {
+            Some(PathElement::Node(n)) => n,
+            _ => {
+                return Err(TransformError::Internal(
+                    "malformed EXISTS path: edge without target node".to_string(),
+                ));
+            }
+        };
+
+        if rel.varlen.is_some() {
+            return Err(TransformError::UnsupportedExpr(
+                "variable-length edges inside EXISTS subqueries are not yet supported"
+                    .to_string(),
+            ));
+        }
+
+        let edge_alias = match &rel.variable {
+            Some(name) => child.register_edge(name),
+            None => {
+                let a = child.next_alias();
+                child.var_kinds.insert(a.clone(), VarKind::Edge);
+                a
+            }
+        };
+
+        let rel_type = rel.rel_types.first().map(|s| s.as_str());
+        let edge_resolver = schema.edge_resolver(rel_type);
+        if let Some(name) = &rel.variable {
+            child.edge_resolvers.insert(name.clone(), edge_resolver);
+        }
+
+        let target_var_name = target_node.variable.clone().unwrap_or_default();
+        let target_label = target_node.labels.first().map(|s| s.as_str());
+        let target_resolver = schema.node_resolver(target_label);
+        let target_alias = if target_var_name.is_empty() {
+            child.next_alias()
+        } else if let Some(existing) = child.get_alias(&target_var_name) {
+            existing.to_string()
+        } else {
+            child.register_node(&target_var_name)
+        };
+        if !target_var_name.is_empty() {
+            child
+                .node_resolvers
+                .insert(target_var_name.clone(), target_resolver);
+        }
+
+        let (edge_joins, edge_conditions) = edge_resolver.traverse_joins(
+            &current_alias,
+            &target_alias,
+            &edge_alias,
+            &rel.direction,
+            false,
+        );
+
+        // Promote the first edge JOIN to FROM if no FROM is set yet.
+        let mut iter = edge_joins.into_iter();
+        if !inner.has_from() {
+            if let Some(first_join) = iter.next() {
+                inner.set_from_aliased(&first_join.table, &first_join.alias);
+                inner.add_where(&first_join.on_condition);
+            }
+        }
+        for j in iter {
+            inner.add_join_aliased(j.join_type, &j.table, &j.alias, &j.on_condition);
+        }
+
+        // Type filter (e.g., for EAV edge resolvers).
+        let type_conditions = edge_resolver.type_filter(&edge_alias, &rel.rel_types);
+        for c in type_conditions {
+            inner.add_where(&c);
+        }
+
+        // Target-node JOIN, using traverse conditions as ON.
+        let target_on = edge_conditions.join(" AND ");
+        inner.add_join_aliased(
+            JoinType::Inner,
+            target_resolver.table(),
+            &target_alias,
+            &target_on,
+        );
+
+        // Apply target node's label/properties/where filters.
+        apply_node_filters_to_inner(
+            &mut child,
+            &mut inner,
+            target_node,
+            target_resolver,
+            &target_alias,
+            schema,
+        )?;
+
+        if let Some(ref where_expr) = rel.where_expr {
+            let sql = transform_expr(&mut child, &mut inner, where_expr, schema)?;
+            inner.add_where(&sql);
+        }
+
+        current_alias = target_alias;
+        current_resolver = target_resolver;
+    }
+    let _ = current_resolver; // silence unused-after-loop warning
+
+    // If the pattern was a single correlated node with no edges, the inner
+    // builder still has no FROM. SQLite accepts `SELECT 1 WHERE …`.
+    if !inner.has_from() && inner_where.is_none() {
+        return Err(TransformError::UnsupportedExpr(
+            "EXISTS over a single correlated node with no predicate is a tautology — drop the EXISTS".to_string(),
+        ));
+    }
+
+    if let Some(w) = inner_where {
+        let sql = transform_expr(&mut child, &mut inner, w, schema)?;
+        inner.add_where(&sql);
+    }
+
+    Ok(format!("EXISTS ({})", inner.build()))
+}
+
+/// Helper for transform_exists_subquery: apply a NodePattern's label /
+/// properties / where_expr filters to the inner builder, mirroring the
+/// per-node filtering work that `transform_node_pattern_with_on` does for
+/// outer queries.
+fn apply_node_filters_to_inner<'a>(
+    child: &mut TransformContext<'a>,
+    inner: &mut SqlBuilder,
+    node: &NodePattern,
+    resolver: &'a dyn NodeResolver,
+    alias: &str,
+    schema: &'a GraphSchema,
+) -> Result<(), TransformError> {
+    for (li, label_str) in node.labels.iter().enumerate() {
+        let frag = resolver.label_joins(alias, label_str, li);
+        for j in &frag.joins {
+            inner.add_join_aliased(j.join_type, &j.table, &j.alias, &j.on_condition);
+        }
+        for c in &frag.conditions {
+            inner.add_where(c);
+        }
+    }
+
+    if let Some(ref props_expr) = node.properties {
+        if let Expr::Map(pairs) = props_expr.as_ref() {
+            for pair in pairs {
+                let value_sql = transform_expr(child, inner, &pair.value, schema)?;
+                let frag =
+                    resolver.property_filter(alias, &pair.key, &value_sql, &pair.value)?;
+                for j in frag.joins {
+                    inner.add_join_aliased(
+                        j.join_type,
+                        &j.table,
+                        &j.alias,
+                        &j.on_condition,
+                    );
+                }
+                for c in frag.conditions {
+                    inner.add_where(&c);
+                }
+            }
+        }
+    }
+
+    if let Some(ref where_expr) = node.where_expr {
+        let sql = transform_expr(child, inner, where_expr, schema)?;
+        inner.add_where(&sql);
+    }
+
+    Ok(())
 }
 
 // ===== CREATE-only transforms =====
@@ -2180,7 +2500,10 @@ fn transform_match_delete<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resolver::GraphSchema;
+    use crate::resolver::{
+        ColumnMapping, EavEdgeResolver, EavNodeResolver, GraphSchema, MappedNodeResolver,
+        NodeResolver,
+    };
     use gql_parser::{
         Clause, CreateClause, Direction, Expr, Literal, MatchClause, NodePattern, Path,
         PathElement, PathType, Query, RelPattern, ReturnClause, ReturnItem,
@@ -2460,6 +2783,8 @@ mod tests {
                         column_name: "content".into(),
                     },
                 ],
+                extension_column: None,
+                multi_value_properties: std::collections::HashMap::new(),
             }),
         );
 
@@ -2551,6 +2876,8 @@ mod tests {
                         column_name: "content".into(),
                     },
                 ],
+                extension_column: None,
+                multi_value_properties: std::collections::HashMap::new(),
             }),
         );
 
@@ -2629,6 +2956,8 @@ mod tests {
                         column_name: "block_id".into(),
                     },
                 ],
+                extension_column: None,
+                multi_value_properties: std::collections::HashMap::new(),
             }),
         );
         nodes.insert(
@@ -2651,6 +2980,8 @@ mod tests {
                         column_name: "content".into(),
                     },
                 ],
+                extension_column: None,
+                multi_value_properties: std::collections::HashMap::new(),
             }),
         );
 
@@ -2820,6 +3151,8 @@ mod tests {
                         column_name: "parent_id".into(),
                     },
                 ],
+                extension_column: None,
+                multi_value_properties: std::collections::HashMap::new(),
             }),
         );
 
@@ -2868,6 +3201,8 @@ mod tests {
                         column_name: "block_id".into(),
                     },
                 ],
+                extension_column: None,
+                multi_value_properties: std::collections::HashMap::new(),
             }),
         );
         nodes.insert(
@@ -2886,6 +3221,8 @@ mod tests {
                         column_name: "parent_id".into(),
                     },
                 ],
+                extension_column: None,
+                multi_value_properties: std::collections::HashMap::new(),
             }),
         );
 
@@ -2942,6 +3279,8 @@ mod tests {
                         column_name: "block_id".into(),
                     },
                 ],
+                extension_column: None,
+                multi_value_properties: std::collections::HashMap::new(),
             }),
         );
         nodes.insert(
@@ -2960,6 +3299,8 @@ mod tests {
                         column_name: "parent_id".into(),
                     },
                 ],
+                extension_column: None,
+                multi_value_properties: std::collections::HashMap::new(),
             }),
         );
 
@@ -2997,6 +3338,600 @@ mod tests {
         assert!(
             sql.contains("JOIN blocks AS _v1 ON"),
             "Bridge OR should be in JOIN ON.\nGenerated SQL: {sql}"
+        );
+    }
+
+    // ===== Patch 1 fixtures: extension column / json_extract fallback =====
+
+    fn block_schema_with_extension() -> GraphSchema {
+        use crate::resolver::*;
+        let mut nodes: std::collections::HashMap<String, Box<dyn NodeResolver>> =
+            std::collections::HashMap::new();
+        nodes.insert(
+            "block".into(),
+            Box::new(MappedNodeResolver {
+                table_name: "block".into(),
+                id_col: "id".into(),
+                label: "block".into(),
+                columns: vec![
+                    ColumnMapping {
+                        property_name: "id".into(),
+                        column_name: "id".into(),
+                    },
+                    ColumnMapping {
+                        property_name: "content_type".into(),
+                        column_name: "content_type".into(),
+                    },
+                ],
+                extension_column: Some("properties".into()),
+                multi_value_properties: std::collections::HashMap::new(),
+            }),
+        );
+        GraphSchema {
+            nodes,
+            edges: std::collections::HashMap::new(),
+            default_node_resolver: Box::new(EavNodeResolver),
+            default_edge_resolver: Box::new(EavEdgeResolver),
+            raw_return: true,
+        }
+    }
+
+    #[test]
+    fn test_extension_column_unmapped_property_in_where() {
+        let schema = block_schema_with_extension();
+        let parsed = gql_parser::parse(
+            "MATCH (b:block) WHERE b.priority = '1' RETURN b",
+        )
+        .unwrap();
+        let q = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&q, &schema).unwrap();
+        assert!(
+            sql.contains("json_extract(_v0.\"properties\", '$.priority') = '1'"),
+            "unmapped property should lower to json_extract: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_extension_column_mapped_column_unaffected() {
+        let schema = block_schema_with_extension();
+        let parsed = gql_parser::parse(
+            "MATCH (b:block) WHERE b.content_type = 'text' RETURN b",
+        )
+        .unwrap();
+        let q = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&q, &schema).unwrap();
+        assert!(
+            sql.contains("_v0.\"content_type\" = 'text'"),
+            "mapped column path should be unchanged: {sql}"
+        );
+        assert!(
+            !sql.contains("json_extract(_v0.\"properties\", '$.content_type')"),
+            "mapped column must not go through json_extract: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_extension_column_order_by_mixed() {
+        let schema = block_schema_with_extension();
+        let parsed = gql_parser::parse(
+            "MATCH (b:block) RETURN b ORDER BY b.priority, b.id",
+        )
+        .unwrap();
+        let q = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&q, &schema).unwrap();
+        assert!(
+            sql.contains("ORDER BY json_extract(_v0.\"properties\", '$.priority'), _v0.\"id\""),
+            "ORDER BY should mix json_extract and direct column: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_extension_column_unknown_without_extension_errors() {
+        use crate::resolver::*;
+        // Schema without extension_column: unmapped property must fail to compile.
+        let mut nodes: std::collections::HashMap<String, Box<dyn NodeResolver>> =
+            std::collections::HashMap::new();
+        nodes.insert(
+            "block".into(),
+            Box::new(MappedNodeResolver {
+                table_name: "block".into(),
+                id_col: "id".into(),
+                label: "block".into(),
+                columns: vec![ColumnMapping {
+                    property_name: "id".into(),
+                    column_name: "id".into(),
+                }],
+                extension_column: None,
+                multi_value_properties: std::collections::HashMap::new(),
+            }),
+        );
+        let schema = GraphSchema {
+            nodes,
+            edges: std::collections::HashMap::new(),
+            default_node_resolver: Box::new(EavNodeResolver),
+            default_edge_resolver: Box::new(EavEdgeResolver),
+            raw_return: true,
+        };
+        let parsed =
+            gql_parser::parse("MATCH (b:block) WHERE b.priority = '1' RETURN b").unwrap();
+        let q = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let result = transform_query(&q, &schema);
+        match result {
+            Err(crate::TransformError::UnknownProperty { entity, property }) => {
+                assert_eq!(entity, "block");
+                assert_eq!(property, "priority");
+            }
+            other => panic!(
+                "expected UnknownProperty error for unmapped property without extension_column, got: {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn test_extension_column_return_node_merges_json() {
+        // Non-raw_return so all_properties_expr is exercised by RETURN b.
+        let mut nodes: std::collections::HashMap<String, Box<dyn NodeResolver>> =
+            std::collections::HashMap::new();
+        nodes.insert(
+            "block".into(),
+            Box::new(MappedNodeResolver {
+                table_name: "block".into(),
+                id_col: "id".into(),
+                label: "block".into(),
+                columns: vec![
+                    ColumnMapping {
+                        property_name: "id".into(),
+                        column_name: "id".into(),
+                    },
+                    ColumnMapping {
+                        property_name: "content_type".into(),
+                        column_name: "content_type".into(),
+                    },
+                ],
+                extension_column: Some("properties".into()),
+                multi_value_properties: std::collections::HashMap::new(),
+            }),
+        );
+        let schema = GraphSchema {
+            nodes,
+            edges: std::collections::HashMap::new(),
+            default_node_resolver: Box::new(EavNodeResolver),
+            default_edge_resolver: Box::new(EavEdgeResolver),
+            raw_return: false,
+        };
+        let parsed = gql_parser::parse("MATCH (b:block) RETURN b").unwrap();
+        let q = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&q, &schema).unwrap();
+        assert!(
+            sql.contains("json_patch("),
+            "RETURN b should merge mapped columns and JSON extension via json_patch: {sql}"
+        );
+        assert!(
+            sql.contains("COALESCE(_v0.\"properties\", json('{}'))"),
+            "extension column should be COALESCEd to empty JSON: {sql}"
+        );
+    }
+
+    // ===== Patch 4 fixtures: multi-value properties =====
+
+    fn block_schema_with_tags() -> GraphSchema {
+        use crate::resolver::*;
+        let mut nodes: std::collections::HashMap<String, Box<dyn NodeResolver>> =
+            std::collections::HashMap::new();
+        let mut multi: std::collections::HashMap<String, MultiValueBacking> =
+            std::collections::HashMap::new();
+        multi.insert(
+            "tags".into(),
+            MultiValueBacking {
+                table: "block_tags".into(),
+                source_column: "block_id".into(),
+                value_column: "tag".into(),
+            },
+        );
+        nodes.insert(
+            "block".into(),
+            Box::new(MappedNodeResolver {
+                table_name: "block".into(),
+                id_col: "id".into(),
+                label: "block".into(),
+                columns: vec![ColumnMapping {
+                    property_name: "id".into(),
+                    column_name: "id".into(),
+                }],
+                extension_column: Some("properties".into()),
+                multi_value_properties: multi,
+            }),
+        );
+        GraphSchema {
+            nodes,
+            edges: std::collections::HashMap::new(),
+            default_node_resolver: Box::new(EavNodeResolver),
+            default_edge_resolver: Box::new(EavEdgeResolver),
+            raw_return: true,
+        }
+    }
+
+    #[test]
+    fn test_multi_value_in_lowers_to_exists_against_index() {
+        let schema = block_schema_with_tags();
+        let parsed =
+            gql_parser::parse("MATCH (b:block) WHERE 'agent' IN b.tags RETURN b").unwrap();
+        let q = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&q, &schema).unwrap();
+        assert!(
+            sql.contains(
+                "EXISTS (SELECT 1 FROM \"block_tags\" WHERE \"block_tags\".\"block_id\" = _v0.\"id\" AND \"block_tags\".\"tag\" = 'agent')"
+            ),
+            "<x> IN b.tags should lower to EXISTS over the inverted index: {sql}"
+        );
+        // Must NOT lower to a json_each scan or aggregate IN.
+        assert!(
+            !sql.contains("json_each"),
+            "must not use json_each: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_multi_value_not_in_via_outer_not() {
+        let schema = block_schema_with_tags();
+        let parsed = gql_parser::parse(
+            "MATCH (b:block) WHERE NOT ('human-only' IN b.tags) RETURN b",
+        )
+        .unwrap();
+        let q = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&q, &schema).unwrap();
+        assert!(
+            sql.contains("NOT (EXISTS (SELECT 1 FROM \"block_tags\""),
+            "NOT (<x> IN b.tags) should wrap EXISTS in NOT: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_multi_value_combined_with_or() {
+        let schema = block_schema_with_tags();
+        let parsed = gql_parser::parse(
+            "MATCH (b:block) WHERE 'agent' IN b.tags OR NOT ('human-only' IN b.tags) RETURN b",
+        )
+        .unwrap();
+        let q = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&q, &schema).unwrap();
+        // Both branches must be inverted-index EXISTS.
+        assert!(
+            sql.matches("FROM \"block_tags\"").count() == 2,
+            "both 'agent' and 'human-only' clauses should produce EXISTS over block_tags: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_multi_value_property_in_return_aggregates() {
+        let schema = block_schema_with_tags();
+        let parsed = gql_parser::parse("MATCH (b:block) RETURN b.tags").unwrap();
+        let q = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&q, &schema).unwrap();
+        assert!(
+            sql.contains(
+                "SELECT (SELECT COALESCE(json_group_array(\"block_tags\".\"tag\"), json('[]')) FROM \"block_tags\" WHERE \"block_tags\".\"block_id\" = _v0.\"id\")"
+            ),
+            "RETURN b.tags should aggregate to a JSON array: {sql}"
+        );
+    }
+
+    // ===== Patch 2 fixtures: EXISTS { ... } subqueries =====
+
+    fn block_schema_with_blockers() -> GraphSchema {
+        use crate::resolver::*;
+        let mut nodes: std::collections::HashMap<String, Box<dyn NodeResolver>> =
+            std::collections::HashMap::new();
+        nodes.insert(
+            "block".into(),
+            Box::new(MappedNodeResolver {
+                table_name: "block".into(),
+                id_col: "id".into(),
+                label: "block".into(),
+                columns: vec![ColumnMapping {
+                    property_name: "id".into(),
+                    column_name: "id".into(),
+                }],
+                extension_column: Some("properties".into()),
+                multi_value_properties: std::collections::HashMap::new(),
+            }),
+        );
+        let mut edges: std::collections::HashMap<String, EdgeDef> =
+            std::collections::HashMap::new();
+        edges.insert(
+            "blocked_by".into(),
+            EdgeDef {
+                source_label: Some("block".into()),
+                target_label: Some("block".into()),
+                resolver: Box::new(JoinTableEdgeResolver {
+                    join_table: "task_blockers".into(),
+                    source_column: "blocked_id".into(),
+                    target_column: "blocker_id".into(),
+                }),
+            },
+        );
+        GraphSchema {
+            nodes,
+            edges,
+            default_node_resolver: Box::new(EavNodeResolver),
+            default_edge_resolver: Box::new(EavEdgeResolver),
+            raw_return: true,
+        }
+    }
+
+    #[test]
+    fn test_exists_simple_correlated_pattern() {
+        let schema = block_schema_with_blockers();
+        let parsed = gql_parser::parse(
+            "MATCH (b:block) WHERE NOT EXISTS { (b)-[:blocked_by]->(blocker:block) } RETURN b",
+        )
+        .unwrap();
+        let q = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&q, &schema).unwrap();
+        assert!(
+            sql.contains("NOT (EXISTS (SELECT 1 FROM task_blockers"),
+            "outer NOT EXISTS should wrap a subquery starting at the join table: {sql}"
+        );
+        assert!(
+            sql.contains("blocked_id = _v0.id"),
+            "subquery must correlate on outer alias: {sql}"
+        );
+        assert!(
+            sql.contains("JOIN block AS"),
+            "subquery should join the target block table: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_exists_with_inner_where() {
+        let schema = block_schema_with_blockers();
+        let parsed = gql_parser::parse(
+            "MATCH (b:block) WHERE NOT EXISTS { (b)-[:blocked_by]->(blocker:block) WHERE blocker.task_state <> 'DONE' } RETURN b",
+        )
+        .unwrap();
+        let q = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&q, &schema).unwrap();
+        // Inner WHERE uses the json_extract path (Patch 1) on the target alias.
+        // The target alias is whichever the child ctx allocates after the
+        // edge alias; we don't pin it strictly — assert structurally.
+        assert!(
+            sql.contains("'$.task_state') <> 'DONE'"),
+            "inner WHERE should reference task_state via json_extract: {sql}"
+        );
+        assert!(
+            sql.contains("json_extract("),
+            "inner WHERE should use json_extract: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_exists_pending_node_filter_not_duplicated_in_subquery() {
+        let schema = block_schema_with_blockers();
+        let parsed = gql_parser::parse(
+            "MATCH (b:block) WHERE b.task_state = 'TODO' AND NOT EXISTS { (b)-[:blocked_by]->(blocker:block) } RETURN b",
+        )
+        .unwrap();
+        let q = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&q, &schema).unwrap();
+        let outer_count = sql.matches("'$.task_state') = 'TODO'").count();
+        assert_eq!(
+            outer_count, 1,
+            "outer task_state filter must appear exactly once (not also inside subquery): {sql}"
+        );
+    }
+
+    #[test]
+    fn test_exists_multi_edge_path() {
+        let schema = block_schema_with_blockers();
+        let parsed = gql_parser::parse(
+            "MATCH (b:block) WHERE EXISTS { (b)-[:blocked_by]->(x:block)-[:blocked_by]->(y:block) } RETURN b",
+        )
+        .unwrap();
+        let q = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&q, &schema).unwrap();
+        // Two task_blockers JOINs in the subquery (one for each hop).
+        let count = sql.matches("task_blockers").count();
+        assert!(
+            count >= 2,
+            "two-hop chain should reference task_blockers twice: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_canonical_now_query_compiles_literal_form() {
+        // End-to-end: the literal Now.org canonical query exercises P1, P2,
+        // P3, and P4 simultaneously. After all four patches it compiles
+        // without source rewrites; we assert the emitted SQL has the
+        // structurally-correct shape (modulo alias names).
+        use crate::resolver::*;
+        let mut nodes: std::collections::HashMap<String, Box<dyn NodeResolver>> =
+            std::collections::HashMap::new();
+        let mut multi: std::collections::HashMap<String, MultiValueBacking> =
+            std::collections::HashMap::new();
+        multi.insert(
+            "tags".into(),
+            MultiValueBacking {
+                table: "block_tags".into(),
+                source_column: "block_id".into(),
+                value_column: "tag".into(),
+            },
+        );
+        nodes.insert(
+            "block".into(),
+            Box::new(MappedNodeResolver {
+                table_name: "block".into(),
+                id_col: "id".into(),
+                label: "block".into(),
+                columns: vec![
+                    ColumnMapping {
+                        property_name: "id".into(),
+                        column_name: "id".into(),
+                    },
+                    ColumnMapping {
+                        property_name: "content_type".into(),
+                        column_name: "content_type".into(),
+                    },
+                ],
+                extension_column: Some("properties".into()),
+                multi_value_properties: multi,
+            }),
+        );
+        let mut edges: std::collections::HashMap<String, EdgeDef> =
+            std::collections::HashMap::new();
+        edges.insert(
+            "blocked_by".into(),
+            EdgeDef {
+                source_label: Some("block".into()),
+                target_label: Some("block".into()),
+                resolver: Box::new(JoinTableEdgeResolver {
+                    join_table: "task_blockers".into(),
+                    source_column: "blocked_id".into(),
+                    target_column: "blocker_id".into(),
+                }),
+            },
+        );
+        let schema = GraphSchema {
+            nodes,
+            edges,
+            default_node_resolver: Box::new(EavNodeResolver),
+            default_edge_resolver: Box::new(EavEdgeResolver),
+            raw_return: true,
+        };
+
+        let gql = "MATCH (b:block) \
+                   WHERE b.task_state = 'TODO' \
+                     AND b.gate = 'G1' \
+                     AND NOT EXISTS { (b)-[:blocked_by]->(blocker:block) WHERE blocker.task_state <> 'DONE' } \
+                     AND ('agent' IN b.tags OR NOT ('human-only' IN b.tags)) \
+                   RETURN b \
+                   ORDER BY b.priority, b.effort, b.id \
+                   LIMIT 10";
+        let parsed = gql_parser::parse(gql).unwrap();
+        let q = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&q, &schema).unwrap();
+
+        // P1: extension column for unknown scalar properties.
+        assert!(
+            sql.contains("json_extract(_v0.\"properties\", '$.task_state') = 'TODO'"),
+            "P1 task_state filter: {sql}"
+        );
+        assert!(
+            sql.contains("json_extract(_v0.\"properties\", '$.gate') = 'G1'"),
+            "P1 gate filter: {sql}"
+        );
+        // P2 + P3: NOT EXISTS subquery using JoinTableEdgeResolver.
+        assert!(
+            sql.contains("NOT (EXISTS (SELECT 1 FROM task_blockers"),
+            "P2 NOT EXISTS over join table: {sql}"
+        );
+        assert!(
+            sql.contains("blocked_id = _v0.id"),
+            "P2 correlation predicate: {sql}"
+        );
+        assert!(
+            sql.contains("'$.task_state') <> 'DONE'"),
+            "P2 inner WHERE through Patch-1 extension column: {sql}"
+        );
+        // P4: multi-value property → EXISTS over inverted index.
+        assert!(
+            sql.contains(
+                "EXISTS (SELECT 1 FROM \"block_tags\" WHERE \"block_tags\".\"block_id\" = _v0.\"id\" AND \"block_tags\".\"tag\" = 'agent')"
+            ),
+            "P4 'agent' IN b.tags: {sql}"
+        );
+        assert!(
+            sql.contains(
+                "EXISTS (SELECT 1 FROM \"block_tags\" WHERE \"block_tags\".\"block_id\" = _v0.\"id\" AND \"block_tags\".\"tag\" = 'human-only')"
+            ),
+            "P4 'human-only' IN b.tags: {sql}"
+        );
+        // ORDER BY mixes JSON-extension and direct id column.
+        assert!(
+            sql.contains(
+                "ORDER BY json_extract(_v0.\"properties\", '$.priority'), json_extract(_v0.\"properties\", '$.effort'), _v0.\"id\""
+            ),
+            "ORDER BY mixes Patch-1 extension and direct id: {sql}"
+        );
+        // LIMIT 10.
+        assert!(sql.contains(" LIMIT 10"), "LIMIT 10: {sql}");
+    }
+
+    #[test]
+    fn test_exists_nested() {
+        let schema = block_schema_with_blockers();
+        let parsed = gql_parser::parse(
+            "MATCH (b:block) WHERE NOT EXISTS { (b)-[:blocked_by]->(blocker:block) WHERE NOT EXISTS { (blocker)-[:blocked_by]->(deeper:block) } } RETURN b",
+        )
+        .unwrap();
+        let q = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&q, &schema).unwrap();
+        // Two NOT EXISTS levels.
+        let count = sql.matches("NOT (EXISTS").count();
+        assert_eq!(count, 2, "nested EXISTS should produce two NOT EXISTS levels: {sql}");
+    }
+
+    #[test]
+    fn test_multi_value_in_literal_list_unchanged() {
+        // `<x> IN [a, b, c]` must NOT trigger Patch 4 dispatch — the existing
+        // literal-list semantics is preserved.
+        let schema = block_schema_with_tags();
+        let parsed = gql_parser::parse(
+            "MATCH (b:block) WHERE b.id IN ['x', 'y', 'z'] RETURN b",
+        )
+        .unwrap();
+        let q = match parsed {
+            gql_parser::QueryOrUnion::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let sql = transform_query(&q, &schema).unwrap();
+        assert!(
+            sql.contains("_v0.\"id\" IN ("),
+            "literal-list IN should remain unchanged: {sql}"
         );
     }
 }

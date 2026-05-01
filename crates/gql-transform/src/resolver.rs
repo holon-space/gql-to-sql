@@ -46,9 +46,15 @@ pub trait NodeResolver: Send + Sync {
         property: &str,
         value_sql: &str,
         value_expr: &Expr,
-    ) -> FilterFragment;
+    ) -> Result<FilterFragment, TransformError>;
 
-    fn property_expr(&self, alias: &str, property: &str, prop_index: usize) -> PropertyFragment;
+    fn property_expr(
+        &self,
+        alias: &str,
+        property: &str,
+        prop_index: usize,
+    ) -> Result<PropertyFragment, TransformError>;
+
     fn all_properties_expr(&self, alias: &str) -> String;
     fn labels_expr(&self, alias: &str) -> String;
     fn node_json_object(&self, alias: &str) -> String;
@@ -70,11 +76,53 @@ pub trait NodeResolver: Send + Sync {
 
     fn delete_sql(&self, alias: &str, from_clause: &str, detach: bool) -> Vec<String>;
 
-    fn remove_property_sql(&self, alias: &str, from_clause: &str, property: &str) -> Vec<String>;
+    fn remove_property_sql(
+        &self,
+        alias: &str,
+        from_clause: &str,
+        property: &str,
+    ) -> Result<Vec<String>, TransformError>;
 
     fn remove_label_sql(&self, alias: &str, from_clause: &str, label: &str) -> Vec<String>;
 
-    fn nested_property_expr(&self, alias: &str, json_key: &str, json_path: &str) -> String;
+    fn nested_property_expr(
+        &self,
+        alias: &str,
+        json_key: &str,
+        json_path: &str,
+    ) -> Result<String, TransformError>;
+
+    /// Returns true if `property` is a multi-valued property backed by an
+    /// inverted-index table (Patch 4). The compiler dispatches IN/NOT-IN
+    /// against such properties to a different codepath.
+    fn is_multi_value_property(&self, _property: &str) -> bool {
+        false
+    }
+
+    /// Generates SQL for `<member_sql> IN <alias>.<property>` when `property`
+    /// is a multi-value property. Default impl returns an internal error.
+    fn multi_value_membership_expr(
+        &self,
+        _alias: &str,
+        property: &str,
+        _member_sql: &str,
+    ) -> Result<String, TransformError> {
+        Err(TransformError::Internal(format!(
+            "multi_value_membership_expr called on resolver that does not support property '{property}'"
+        )))
+    }
+
+    /// Generates SQL projecting all members of `<alias>.<property>` as a JSON
+    /// array when `property` is a multi-value property.
+    fn multi_value_aggregate_expr(
+        &self,
+        _alias: &str,
+        property: &str,
+    ) -> Result<String, TransformError> {
+        Err(TransformError::Internal(format!(
+            "multi_value_aggregate_expr called on resolver that does not support property '{property}'"
+        )))
+    }
 }
 
 // ---- Edge resolver trait ----
@@ -220,7 +268,7 @@ impl NodeResolver for EavNodeResolver {
         property: &str,
         value_sql: &str,
         value_expr: &Expr,
-    ) -> FilterFragment {
+    ) -> Result<FilterFragment, TransformError> {
         let pk_alias = format!("_pk_{alias}_{property}");
         let prop_alias = format!("_pp_{alias}_{property}");
 
@@ -232,7 +280,7 @@ impl NodeResolver for EavNodeResolver {
         };
 
         let escaped_key = escape_sql_string(property);
-        FilterFragment {
+        Ok(FilterFragment {
             joins: vec![
                 JoinFragment {
                     join_type: JoinType::Inner,
@@ -251,10 +299,15 @@ impl NodeResolver for EavNodeResolver {
                 format!("{pk_alias}.key = '{escaped_key}'"),
                 format!("{prop_alias}.value = {value_sql}"),
             ],
-        }
+        })
     }
 
-    fn property_expr(&self, alias: &str, property: &str, prop_index: usize) -> PropertyFragment {
+    fn property_expr(
+        &self,
+        alias: &str,
+        property: &str,
+        prop_index: usize,
+    ) -> Result<PropertyFragment, TransformError> {
         let p = escape_sql_string(property);
         let pk = format!("_pk_{alias}_{prop_index}");
         let npt = format!("_npt_{alias}_{prop_index}");
@@ -262,7 +315,7 @@ impl NodeResolver for EavNodeResolver {
         let npr = format!("_npr_{alias}_{prop_index}");
         let npb = format!("_npb_{alias}_{prop_index}");
         let npj = format!("_npj_{alias}_{prop_index}");
-        PropertyFragment {
+        Ok(PropertyFragment {
             expr: format!(
                 "COALESCE({npt}.value, {npi}.value, {npr}.value, {npb}.value, {npj}.value)"
             ),
@@ -305,7 +358,7 @@ impl NodeResolver for EavNodeResolver {
                 },
             ],
             conditions: vec![],
-        }
+        })
     }
 
     fn all_properties_expr(&self, alias: &str) -> String {
@@ -414,9 +467,14 @@ SELECT {alias}.id, (SELECT id FROM property_keys WHERE key = '{escaped_key}'), {
         stmts
     }
 
-    fn remove_property_sql(&self, alias: &str, from_clause: &str, property: &str) -> Vec<String> {
+    fn remove_property_sql(
+        &self,
+        alias: &str,
+        from_clause: &str,
+        property: &str,
+    ) -> Result<Vec<String>, TransformError> {
         let escaped_key = escape_sql_string(property);
-        [
+        Ok([
             "node_props_text",
             "node_props_int",
             "node_props_real",
@@ -430,7 +488,7 @@ SELECT {alias}.id, (SELECT id FROM property_keys WHERE key = '{escaped_key}'), {
 AND key_id = (SELECT id FROM property_keys WHERE key = '{escaped_key}')"
             )
         })
-        .collect()
+        .collect())
     }
 
     fn remove_label_sql(&self, alias: &str, from_clause: &str, label: &str) -> Vec<String> {
@@ -441,13 +499,18 @@ AND label = '{escaped}'"
         )]
     }
 
-    fn nested_property_expr(&self, alias: &str, json_key: &str, json_path: &str) -> String {
+    fn nested_property_expr(
+        &self,
+        alias: &str,
+        json_key: &str,
+        json_path: &str,
+    ) -> Result<String, TransformError> {
         let escaped_key = escape_sql_string(json_key);
-        format!(
+        Ok(format!(
             "json_extract(\
 (SELECT json(npj.value) FROM node_props_json npj JOIN property_keys pk ON npj.key_id = pk.id WHERE npj.node_id = {alias}.id AND pk.key = '{escaped_key}'), \
 '{json_path}')"
-        )
+        ))
     }
 }
 
@@ -597,11 +660,41 @@ pub struct ColumnMapping {
     pub column_name: String,
 }
 
+/// Inverted-index storage backing for a multi-valued property (Patch 4).
+///
+/// E.g. `tags` on `block` is logically a list-valued property, physically
+/// stored as `block_tags(block_id, tag)`. Backing this lets `'x' IN b.tags`
+/// compile to an index-friendly `EXISTS (SELECT 1 FROM block_tags WHERE
+/// block_id = b.id AND tag = 'x')`.
+#[derive(Debug, Clone)]
+pub struct MultiValueBacking {
+    pub table: String,
+    pub source_column: String,
+    pub value_column: String,
+}
+
+/// Classifies how a property name resolves to SQL for `MappedNodeResolver`.
+enum ColumnRef<'a> {
+    /// Property maps directly to a real column on the entity's table.
+    Direct(String),
+    /// Property is unmapped; project from a JSON extension column.
+    JsonExtension { col: String, key: String },
+    /// Property is multi-valued, backed by an inverted-index table (Patch 4).
+    MultiValue(&'a MultiValueBacking),
+}
+
 pub struct MappedNodeResolver {
     pub table_name: String,
     pub id_col: String,
     pub label: String,
     pub columns: Vec<ColumnMapping>,
+    /// Optional JSON column on the entity's table that backs unmapped property
+    /// names. When set, `b.<unknown>` lowers to `json_extract({alias}.{col},
+    /// '$.<unknown>')` rather than failing or emitting a broken bare-column
+    /// reference. (Patch 1.)
+    pub extension_column: Option<String>,
+    /// Properties stored in inverted-index tables. (Patch 4.)
+    pub multi_value_properties: HashMap<String, MultiValueBacking>,
 }
 
 impl NodeResolver for MappedNodeResolver {
@@ -627,25 +720,57 @@ impl NodeResolver for MappedNodeResolver {
         property: &str,
         value_sql: &str,
         _value_expr: &Expr,
-    ) -> FilterFragment {
-        let col = quote_ident(&self.column_for(property));
-        FilterFragment {
+    ) -> Result<FilterFragment, TransformError> {
+        let cond = match self.column_for(property)? {
+            ColumnRef::Direct(col) => {
+                format!("{alias}.{} = {value_sql}", quote_ident(&col))
+            }
+            ColumnRef::JsonExtension { col, key } => {
+                format!(
+                    "json_extract({alias}.{}, '$.{}') = {value_sql}",
+                    quote_ident(&col),
+                    escape_sql_string(&key),
+                )
+            }
+            ColumnRef::MultiValue(_) => {
+                return Err(TransformError::UnsupportedExpr(format!(
+                    "property '{property}' on '{}' is multi-valued — use IN (e.g. '<x> IN b.{property}'), not equality",
+                    self.label
+                )));
+            }
+        };
+        Ok(FilterFragment {
             joins: vec![],
-            conditions: vec![format!("{alias}.{col} = {value_sql}")],
-        }
+            conditions: vec![cond],
+        })
     }
 
-    fn property_expr(&self, alias: &str, property: &str, _prop_index: usize) -> PropertyFragment {
-        let col = quote_ident(&self.column_for(property));
-        PropertyFragment {
-            expr: format!("{alias}.{col}"),
+    fn property_expr(
+        &self,
+        alias: &str,
+        property: &str,
+        _prop_index: usize,
+    ) -> Result<PropertyFragment, TransformError> {
+        let expr = match self.column_for(property)? {
+            ColumnRef::Direct(col) => format!("{alias}.{}", quote_ident(&col)),
+            ColumnRef::JsonExtension { col, key } => format!(
+                "json_extract({alias}.{}, '$.{}')",
+                quote_ident(&col),
+                escape_sql_string(&key),
+            ),
+            ColumnRef::MultiValue(backing) => {
+                self.aggregate_sql(alias, backing)
+            }
+        };
+        Ok(PropertyFragment {
+            expr,
             joins: vec![],
             conditions: vec![],
-        }
+        })
     }
 
     fn all_properties_expr(&self, alias: &str) -> String {
-        let pairs: Vec<String> = self
+        let mut pairs: Vec<String> = self
             .columns
             .iter()
             .map(|c| {
@@ -656,7 +781,22 @@ impl NodeResolver for MappedNodeResolver {
                 )
             })
             .collect();
-        format!("json_object({})", pairs.join(", "))
+        // Project multi-value properties as JSON arrays alongside scalar columns.
+        for (prop_name, backing) in &self.multi_value_properties {
+            let agg = self.aggregate_sql(alias, backing);
+            pairs.push(format!("'{}', {agg}", escape_sql_string(prop_name)));
+        }
+        let mapped_obj = format!("json_object({})", pairs.join(", "));
+        // If an extension column is configured, merge the JSON blob over the
+        // mapped projection so unknown-but-stored properties surface in
+        // `RETURN b`. `json_patch` is right-merge semantics in SQLite json1.
+        match &self.extension_column {
+            Some(col) => format!(
+                "json_patch({mapped_obj}, COALESCE({alias}.{}, json('{{}}')))",
+                quote_ident(col),
+            ),
+            None => mapped_obj,
+        }
     }
 
     fn labels_expr(&self, _alias: &str) -> String {
@@ -677,14 +817,53 @@ impl NodeResolver for MappedNodeResolver {
         _label: &str,
         props: &[(&str, &Expr)],
     ) -> Result<Vec<String>, TransformError> {
-        let mut col_names = Vec::new();
-        let mut values = Vec::new();
+        let mut col_assignments: Vec<(String, String)> = Vec::new();
+        let mut json_extension_pairs: Vec<(String, String)> = Vec::new();
+        let mut multi_value_inserts: Vec<(MultiValueBacking, String)> = Vec::new();
         for (key, value) in props {
-            let col = quote_ident(&self.column_for(key));
-            col_names.push(col);
             let (_, val_sql) = eav_expr_to_sql_value(value)?;
-            values.push(val_sql);
+            match self.column_for(key)? {
+                ColumnRef::Direct(col) => {
+                    col_assignments.push((col, val_sql));
+                }
+                ColumnRef::JsonExtension { col: _, key: json_key } => {
+                    json_extension_pairs.push((json_key, val_sql));
+                }
+                ColumnRef::MultiValue(backing) => {
+                    multi_value_inserts.push((backing.clone(), val_sql));
+                }
+            }
         }
+
+        let mut col_names: Vec<String> = col_assignments
+            .iter()
+            .map(|(c, _)| quote_ident(c))
+            .collect();
+        let mut values: Vec<String> = col_assignments.into_iter().map(|(_, v)| v).collect();
+
+        if !json_extension_pairs.is_empty() {
+            let ext_col = self.extension_column.as_ref().expect(
+                "JsonExtension ColumnRef returned without extension_column set",
+            );
+            let json_object_args: Vec<String> = json_extension_pairs
+                .iter()
+                .map(|(k, v)| format!("'{}', {v}", escape_sql_string(k)))
+                .collect();
+            col_names.push(quote_ident(ext_col));
+            values.push(format!("json_object({})", json_object_args.join(", ")));
+        }
+
+        if !multi_value_inserts.is_empty() {
+            // Multi-value property writes via CREATE require knowing the new
+            // row's id, which is generated by the primary INSERT. This needs
+            // a multi-statement plan that's beyond what insert_sql currently
+            // returns (single primary INSERT); reject for now.
+            return Err(TransformError::UnsupportedExpr(
+                "CREATE writing to a multi-valued property is not yet supported"
+                    .to_string(),
+            ));
+        }
+
         Ok(vec![format!(
             "INSERT INTO {} ({}) VALUES ({})",
             quote_ident(&self.table_name),
@@ -701,12 +880,25 @@ impl NodeResolver for MappedNodeResolver {
         value_sql: &str,
         _is_json: bool,
     ) -> Result<Vec<String>, TransformError> {
-        let col = quote_ident(&self.column_for(property));
         let table = quote_ident(&self.table_name);
         let id = quote_ident(&self.id_col);
-        Ok(vec![format!(
-            "UPDATE {table} SET {col} = {value_sql} WHERE {id} IN (SELECT {alias}.{id}{from_clause})",
-        )])
+        let stmt = match self.column_for(property)? {
+            ColumnRef::Direct(col) => format!(
+                "UPDATE {table} SET {} = {value_sql} WHERE {id} IN (SELECT {alias}.{id}{from_clause})",
+                quote_ident(&col),
+            ),
+            ColumnRef::JsonExtension { col, key } => format!(
+                "UPDATE {table} SET {ext} = json_set(COALESCE({ext}, json('{{}}')), '$.{}', {value_sql}) WHERE {id} IN (SELECT {alias}.{id}{from_clause})",
+                escape_sql_string(&key),
+                ext = quote_ident(&col),
+            ),
+            ColumnRef::MultiValue(_) => {
+                return Err(TransformError::UnsupportedExpr(format!(
+                    "SET on a multi-valued property '{property}' is not supported — use CREATE/DELETE on the backing edge instead"
+                )));
+            }
+        };
+        Ok(vec![stmt])
     }
 
     fn delete_sql(&self, alias: &str, from_clause: &str, _detach: bool) -> Vec<String> {
@@ -717,32 +909,134 @@ impl NodeResolver for MappedNodeResolver {
         )]
     }
 
-    fn remove_property_sql(&self, alias: &str, from_clause: &str, property: &str) -> Vec<String> {
-        let col = quote_ident(&self.column_for(property));
+    fn remove_property_sql(
+        &self,
+        alias: &str,
+        from_clause: &str,
+        property: &str,
+    ) -> Result<Vec<String>, TransformError> {
         let table = quote_ident(&self.table_name);
         let id = quote_ident(&self.id_col);
-        vec![format!(
-            "UPDATE {table} SET {col} = NULL WHERE {id} IN (SELECT {alias}.{id}{from_clause})"
-        )]
+        let stmt = match self.column_for(property)? {
+            ColumnRef::Direct(col) => format!(
+                "UPDATE {table} SET {} = NULL WHERE {id} IN (SELECT {alias}.{id}{from_clause})",
+                quote_ident(&col),
+            ),
+            ColumnRef::JsonExtension { col, key } => format!(
+                "UPDATE {table} SET {ext} = json_remove(COALESCE({ext}, json('{{}}')), '$.{}') WHERE {id} IN (SELECT {alias}.{id}{from_clause})",
+                escape_sql_string(&key),
+                ext = quote_ident(&col),
+            ),
+            ColumnRef::MultiValue(_) => {
+                return Err(TransformError::UnsupportedExpr(format!(
+                    "REMOVE on a multi-valued property '{property}' is not supported"
+                )));
+            }
+        };
+        Ok(vec![stmt])
     }
 
     fn remove_label_sql(&self, _alias: &str, _from_clause: &str, _label: &str) -> Vec<String> {
         vec![]
     }
 
-    fn nested_property_expr(&self, alias: &str, json_key: &str, json_path: &str) -> String {
-        let col = quote_ident(&self.column_for(json_key));
-        format!("json_extract({alias}.{col}, '{json_path}')")
+    fn nested_property_expr(
+        &self,
+        alias: &str,
+        json_key: &str,
+        json_path: &str,
+    ) -> Result<String, TransformError> {
+        match self.column_for(json_key)? {
+            ColumnRef::Direct(col) => Ok(format!(
+                "json_extract({alias}.{}, '{json_path}')",
+                quote_ident(&col),
+            )),
+            ColumnRef::JsonExtension { col, key } => Ok(format!(
+                "json_extract({alias}.{}, '$.{}.{}')",
+                quote_ident(&col),
+                escape_sql_string(&key),
+                // json_path is provided as `$.foo.bar`; strip the leading `$.`
+                // so it becomes a sub-path of the extension column key.
+                json_path.trim_start_matches("$.").trim_start_matches('$'),
+            )),
+            ColumnRef::MultiValue(_) => Err(TransformError::UnsupportedExpr(format!(
+                "nested property access on multi-valued property '{json_key}' is not supported"
+            ))),
+        }
+    }
+
+    fn is_multi_value_property(&self, property: &str) -> bool {
+        self.multi_value_properties.contains_key(property)
+    }
+
+    fn multi_value_membership_expr(
+        &self,
+        alias: &str,
+        property: &str,
+        member_sql: &str,
+    ) -> Result<String, TransformError> {
+        let backing = self.multi_value_properties.get(property).ok_or_else(|| {
+            TransformError::Internal(format!(
+                "multi_value_membership_expr called for non-multi-value property '{property}' on '{}'",
+                self.label
+            ))
+        })?;
+        let id = quote_ident(&self.id_col);
+        Ok(format!(
+            "EXISTS (SELECT 1 FROM {tbl} WHERE {tbl}.{src} = {alias}.{id} AND {tbl}.{val} = {member_sql})",
+            tbl = quote_ident(&backing.table),
+            src = quote_ident(&backing.source_column),
+            val = quote_ident(&backing.value_column),
+        ))
+    }
+
+    fn multi_value_aggregate_expr(
+        &self,
+        alias: &str,
+        property: &str,
+    ) -> Result<String, TransformError> {
+        let backing = self.multi_value_properties.get(property).ok_or_else(|| {
+            TransformError::Internal(format!(
+                "multi_value_aggregate_expr called for non-multi-value property '{property}' on '{}'",
+                self.label
+            ))
+        })?;
+        Ok(self.aggregate_sql(alias, backing))
     }
 }
 
 impl MappedNodeResolver {
-    fn column_for(&self, property: &str) -> String {
-        self.columns
-            .iter()
-            .find(|c| c.property_name == property)
-            .map(|c| c.column_name.clone())
-            .unwrap_or_else(|| property.to_string())
+    fn column_for(&self, property: &str) -> Result<ColumnRef<'_>, TransformError> {
+        if let Some(c) = self.columns.iter().find(|c| c.property_name == property) {
+            return Ok(ColumnRef::Direct(c.column_name.clone()));
+        }
+        // The GQL identity `b.id` always projects the resolver's id_col.
+        if property == "id" {
+            return Ok(ColumnRef::Direct(self.id_col.clone()));
+        }
+        if let Some(backing) = self.multi_value_properties.get(property) {
+            return Ok(ColumnRef::MultiValue(backing));
+        }
+        if let Some(col) = &self.extension_column {
+            return Ok(ColumnRef::JsonExtension {
+                col: col.clone(),
+                key: property.to_string(),
+            });
+        }
+        Err(TransformError::UnknownProperty {
+            entity: self.label.clone(),
+            property: property.to_string(),
+        })
+    }
+
+    fn aggregate_sql(&self, alias: &str, backing: &MultiValueBacking) -> String {
+        let id = quote_ident(&self.id_col);
+        format!(
+            "(SELECT COALESCE(json_group_array({tbl}.{val}), json('[]')) FROM {tbl} WHERE {tbl}.{src} = {alias}.{id})",
+            tbl = quote_ident(&backing.table),
+            src = quote_ident(&backing.source_column),
+            val = quote_ident(&backing.value_column),
+        )
     }
 }
 
@@ -856,6 +1150,17 @@ impl EdgeResolver for ForeignKeyEdgeResolver {
 
 // ---- Join Table Edge Resolver ----
 
+/// Resolves an edge to an explicit junction table.
+///
+/// **Limitation (Patch 3 follow-up):** the emitted JOIN ON / WHERE clauses
+/// hardcode `.id` for both the source and target node's primary key column.
+/// In other words, this resolver currently assumes both endpoint node
+/// resolvers have `id_column() == "id"`. Holon's `block` table satisfies this.
+/// If you register a `JoinTableEdgeResolver` whose endpoints use a different
+/// id column name, the emitted SQL will be silently wrong (no rows). The
+/// proper fix is to thread the source/target `NodeResolver::id_column()` into
+/// `traverse_joins` / `recursive_step`; deferred behind tests until a real
+/// consumer needs it.
 pub struct JoinTableEdgeResolver {
     pub join_table: String,
     pub source_column: String,

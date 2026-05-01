@@ -1,5 +1,6 @@
 use gql_transform::resolver::{
     ColumnMapping, EdgeDef, ForeignKeyEdgeResolver, JoinTableEdgeResolver, MappedNodeResolver,
+    MultiValueBacking,
 };
 
 fn setup_block_hierarchy() -> graph_executor::GqlExecutor {
@@ -30,6 +31,8 @@ fn setup_block_hierarchy() -> graph_executor::GqlExecutor {
                     column_name: "parent_id".to_string(),
                 },
             ],
+            extension_column: None,
+            multi_value_properties: std::collections::HashMap::new(),
         }),
     );
     exec.register_edge(
@@ -249,6 +252,8 @@ fn test_mapped_node_match() {
                     column_name: "priority".to_string(),
                 },
             ],
+            extension_column: None,
+            multi_value_properties: std::collections::HashMap::new(),
         }),
     );
 
@@ -289,6 +294,8 @@ fn test_mapped_node_where_filter() {
                     column_name: "priority".to_string(),
                 },
             ],
+            extension_column: None,
+            multi_value_properties: std::collections::HashMap::new(),
         }),
     );
 
@@ -335,6 +342,8 @@ fn test_mapped_node_inline_props() {
                     column_name: "priority".to_string(),
                 },
             ],
+            extension_column: None,
+            multi_value_properties: std::collections::HashMap::new(),
         }),
     );
 
@@ -371,6 +380,8 @@ fn test_mapped_node_return_full() {
                 property_name: "content".to_string(),
                 column_name: "content".to_string(),
             }],
+            extension_column: None,
+            multi_value_properties: std::collections::HashMap::new(),
         }),
     );
 
@@ -409,6 +420,8 @@ fn test_mixed_eav_and_mapped() {
                 property_name: "content".to_string(),
                 column_name: "content".to_string(),
             }],
+            extension_column: None,
+            multi_value_properties: std::collections::HashMap::new(),
         }),
     );
 
@@ -467,6 +480,8 @@ fn test_cross_structure_fk_traversal() {
                 property_name: "name".to_string(),
                 column_name: "name".to_string(),
             }],
+            extension_column: None,
+            multi_value_properties: std::collections::HashMap::new(),
         }),
     );
     exec.register_node(
@@ -479,6 +494,8 @@ fn test_cross_structure_fk_traversal() {
                 property_name: "title".to_string(),
                 column_name: "title".to_string(),
             }],
+            extension_column: None,
+            multi_value_properties: std::collections::HashMap::new(),
         }),
     );
     exec.register_edge(
@@ -587,6 +604,8 @@ fn test_cross_structure_join_table_traversal() {
                 property_name: "name".to_string(),
                 column_name: "name".to_string(),
             }],
+            extension_column: None,
+            multi_value_properties: std::collections::HashMap::new(),
         }),
     );
     exec.register_edge(
@@ -766,6 +785,229 @@ fn test_eav_varlen_still_works() {
                 .collect();
             names.sort();
             assert_eq!(names, vec!["Bob", "Charlie"]);
+        }
+        other => panic!("Expected Rows, got: {other:?}"),
+    }
+}
+
+// ===== Patch 3: JoinTableEdgeResolver gap-fill (reverse direction + varlen) =====
+
+fn setup_friendships_join_table() -> GqlExecutor {
+    let mut exec = GqlExecutor::new_in_memory().unwrap();
+    exec.connection()
+        .execute_batch(
+            "CREATE TABLE people (id TEXT PRIMARY KEY, name TEXT);
+             INSERT INTO people VALUES ('alice',   'Alice');
+             INSERT INTO people VALUES ('bob',     'Bob');
+             INSERT INTO people VALUES ('charlie', 'Charlie');
+             INSERT INTO people VALUES ('dave',    'Dave');
+             CREATE TABLE friendships (a_id TEXT, b_id TEXT);
+             INSERT INTO friendships VALUES ('alice',   'bob');
+             INSERT INTO friendships VALUES ('bob',     'charlie');
+             INSERT INTO friendships VALUES ('charlie', 'dave');",
+        )
+        .unwrap();
+    exec.register_node(
+        "Person",
+        Box::new(MappedNodeResolver {
+            table_name: "people".into(),
+            id_col: "id".into(),
+            label: "Person".into(),
+            columns: vec![ColumnMapping {
+                property_name: "name".into(),
+                column_name: "name".into(),
+            }],
+            extension_column: None,
+            multi_value_properties: std::collections::HashMap::new(),
+        }),
+    );
+    exec.register_edge(
+        "FRIENDS_WITH",
+        EdgeDef {
+            source_label: Some("Person".into()),
+            target_label: Some("Person".into()),
+            resolver: Box::new(JoinTableEdgeResolver {
+                join_table: "friendships".into(),
+                source_column: "a_id".into(),
+                target_column: "b_id".into(),
+            }),
+        },
+    );
+    exec
+}
+
+#[test]
+fn test_join_table_reverse_direction() {
+    let exec = setup_friendships_join_table();
+    // bob's "back-friends": who has bob as their forward friend? → alice.
+    let result = exec
+        .execute(
+            "MATCH (b:Person)<-[:FRIENDS_WITH]-(a:Person) WHERE b.name = 'Bob' RETURN a.name",
+        )
+        .unwrap();
+    match &result {
+        GqlResult::Rows { rows, .. } => {
+            let names: Vec<String> = rows
+                .iter()
+                .map(|r| r[0].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(names, vec!["Alice"]);
+        }
+        other => panic!("Expected Rows, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_join_table_variable_length() {
+    let exec = setup_friendships_join_table();
+    // alice -[*1..3]-> {bob, charlie, dave} via the friendships chain.
+    let result = exec
+        .execute(
+            "MATCH (a:Person)-[:FRIENDS_WITH*1..3]->(b:Person) WHERE a.name = 'Alice' RETURN b.name",
+        )
+        .unwrap();
+    match &result {
+        GqlResult::Rows { rows, .. } => {
+            let mut names: Vec<String> = rows
+                .iter()
+                .map(|r| r[0].as_str().unwrap().to_string())
+                .collect();
+            names.sort();
+            assert_eq!(names, vec!["Bob", "Charlie", "Dave"]);
+        }
+        other => panic!("Expected Rows, got: {other:?}"),
+    }
+}
+
+// ===== End-to-end: literal Now.org canonical query against in-memory data =====
+
+#[test]
+fn test_canonical_now_query_end_to_end() {
+    // Exercises all four patches against a real (in-memory) SQLite database:
+    //   P1: extension column (priority/effort/task_state/gate live in
+    //       block.properties JSON, not as columns)
+    //   P2: NOT EXISTS { ... } over the blocker relationship
+    //   P3: JoinTableEdgeResolver dispatch for :blocked_by → task_blockers
+    //   P4: 'agent' IN b.tags / NOT 'human-only' IN b.tags via inverted index
+    let mut exec = GqlExecutor::new_in_memory().unwrap();
+    exec.connection()
+        .execute_batch(
+            "CREATE TABLE block (
+                 id TEXT PRIMARY KEY,
+                 content_type TEXT,
+                 properties TEXT
+             );
+             CREATE TABLE task_blockers (
+                 blocked_id TEXT NOT NULL,
+                 blocker_id TEXT NOT NULL,
+                 PRIMARY KEY (blocked_id, blocker_id)
+             );
+             CREATE TABLE block_tags (
+                 block_id TEXT NOT NULL,
+                 tag      TEXT NOT NULL,
+                 PRIMARY KEY (block_id, tag)
+             );
+             CREATE INDEX idx_block_tags_tag ON block_tags(tag, block_id);
+
+             -- Candidates (TODO + G1, no active blockers, agent-or-not-human-only):
+             INSERT INTO block VALUES ('a', 'text', json_object('task_state', 'TODO', 'gate', 'G1', 'priority', 2, 'effort', 3));
+             INSERT INTO block VALUES ('b', 'text', json_object('task_state', 'TODO', 'gate', 'G1', 'priority', 1, 'effort', 5));
+             INSERT INTO block VALUES ('d', 'text', json_object('task_state', 'TODO', 'gate', 'G1', 'priority', 1, 'effort', 2));
+             INSERT INTO block VALUES ('f', 'text', json_object('task_state', 'TODO', 'gate', 'G1', 'priority', 3, 'effort', 1));
+             -- Filtered out:
+             INSERT INTO block VALUES ('c', 'text', json_object('task_state', 'TODO', 'gate', 'G1', 'priority', 1, 'effort', 1));   -- only human-only tag
+             INSERT INTO block VALUES ('e', 'text', json_object('task_state', 'TODO', 'gate', 'G1', 'priority', 1, 'effort', 1));   -- has TODO blocker
+             INSERT INTO block VALUES ('g', 'text', json_object('task_state', 'TODO', 'gate', 'G2', 'priority', 1, 'effort', 1));   -- wrong gate
+             INSERT INTO block VALUES ('h', 'text', json_object('task_state', 'DONE', 'gate', 'G1', 'priority', 1, 'effort', 1));   -- already done
+             -- Blockers (referenced from e):
+             INSERT INTO block VALUES ('blocker_active', 'text', json_object('task_state', 'TODO'));
+             INSERT INTO block VALUES ('blocker_done',   'text', json_object('task_state', 'DONE'));
+
+             -- Tag rows:
+             INSERT INTO block_tags VALUES ('b', 'agent');
+             INSERT INTO block_tags VALUES ('c', 'human-only');
+             INSERT INTO block_tags VALUES ('d', 'agent');
+             INSERT INTO block_tags VALUES ('d', 'human-only');
+             -- a, e, f, g, h have no tags → 'NOT human-only IN tags' is true
+
+             -- Blocker relationships:
+             INSERT INTO task_blockers VALUES ('e', 'blocker_active');  -- e is actively blocked
+             INSERT INTO task_blockers VALUES ('f', 'blocker_done');    -- f's blocker is DONE
+             ",
+        )
+        .unwrap();
+
+    let mut multi: std::collections::HashMap<String, MultiValueBacking> =
+        std::collections::HashMap::new();
+    multi.insert(
+        "tags".into(),
+        MultiValueBacking {
+            table: "block_tags".into(),
+            source_column: "block_id".into(),
+            value_column: "tag".into(),
+        },
+    );
+    exec.register_node(
+        "block",
+        Box::new(MappedNodeResolver {
+            table_name: "block".into(),
+            id_col: "id".into(),
+            label: "block".into(),
+            columns: vec![
+                ColumnMapping {
+                    property_name: "id".into(),
+                    column_name: "id".into(),
+                },
+                ColumnMapping {
+                    property_name: "content_type".into(),
+                    column_name: "content_type".into(),
+                },
+            ],
+            extension_column: Some("properties".into()),
+            multi_value_properties: multi,
+        }),
+    );
+    exec.register_edge(
+        "blocked_by",
+        EdgeDef {
+            source_label: Some("block".into()),
+            target_label: Some("block".into()),
+            resolver: Box::new(JoinTableEdgeResolver {
+                join_table: "task_blockers".into(),
+                source_column: "blocked_id".into(),
+                target_column: "blocker_id".into(),
+            }),
+        },
+    );
+
+    // Literal Now.org canonical query — no source rewrites.
+    let gql = "MATCH (b:block) \
+WHERE b.task_state = 'TODO' \
+  AND b.gate = 'G1' \
+  AND NOT EXISTS { (b)-[:blocked_by]->(blocker:block) WHERE blocker.task_state <> 'DONE' } \
+  AND ('agent' IN b.tags OR NOT ('human-only' IN b.tags)) \
+RETURN b.id \
+ORDER BY b.priority, b.effort, b.id \
+LIMIT 10";
+
+    let result = exec.execute(gql).unwrap();
+    match &result {
+        GqlResult::Rows { rows, .. } => {
+            let ids: Vec<String> = rows
+                .iter()
+                .map(|r| r[0].as_str().unwrap().to_string())
+                .collect();
+            // Expected ordering: ASC by priority, then effort, then id.
+            //   d: (1, 2) → first
+            //   b: (1, 5)
+            //   a: (2, 3)
+            //   f: (3, 1) → last
+            // Filtered out: c (only human-only), e (active blocker), g (wrong gate), h (DONE).
+            assert_eq!(
+                ids,
+                vec!["d", "b", "a", "f"],
+                "canonical query must return four candidates in priority/effort/id order"
+            );
         }
         other => panic!("Expected Rows, got: {other:?}"),
     }

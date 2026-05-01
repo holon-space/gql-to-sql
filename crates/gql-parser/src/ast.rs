@@ -262,7 +262,12 @@ pub enum BinaryOp {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExistsExpr {
-    Pattern(Vec<Path>),
+    /// `EXISTS { <pattern-list> [WHERE <expr>] }` — correlated subquery.
+    /// `where_expr` is `None` for the legacy parenthesised form.
+    Pattern {
+        paths: Vec<Path>,
+        where_expr: Option<Box<Expr>>,
+    },
     Property(Box<Expr>),
 }
 

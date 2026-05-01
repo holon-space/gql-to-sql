@@ -1098,12 +1098,24 @@ impl Parser {
 
     fn parse_exists(&mut self) -> Result<Expr, ParseError> {
         self.advance(); // EXISTS
-        self.expect(&Token::LParen)?;
 
-        // EXISTS(n.property) - try property access first
-        // EXISTS((pattern)) - pattern
-        // We need to determine which. If next is ident followed by '.', it's property.
-        // If next is '(' it's a pattern (node pattern start).
+        // GQL/Cypher canonical form: `EXISTS { <pattern> [WHERE <expr>] }`.
+        if self.eat(&Token::LBrace) {
+            let paths = self.parse_pattern_list()?;
+            let where_expr = if self.eat(&Token::Where) {
+                Some(Box::new(self.parse_expr(0)?))
+            } else {
+                None
+            };
+            self.expect(&Token::RBrace)?;
+            return Ok(Expr::Exists(ExistsExpr::Pattern { paths, where_expr }));
+        }
+
+        // Legacy parenthesised forms:
+        //   EXISTS(n.property) — property existence (treated as IS NOT NULL).
+        //   EXISTS((pattern))  — pattern existence; parsed but not supported
+        //                        in the transform.
+        self.expect(&Token::LParen)?;
 
         if self.is_ident() {
             let save = self.pos;
@@ -1118,14 +1130,15 @@ impl Parser {
                     },
                 ))));
             }
-            // Not a property - backtrack and parse as pattern
             self.pos = save;
         }
 
-        // Parse pattern list
-        let pattern = self.parse_pattern_list()?;
+        let paths = self.parse_pattern_list()?;
         self.expect(&Token::RParen)?;
-        Ok(Expr::Exists(ExistsExpr::Pattern(pattern)))
+        Ok(Expr::Exists(ExistsExpr::Pattern {
+            paths,
+            where_expr: None,
+        }))
     }
 
     fn parse_list_predicate(&mut self, pred_type: ListPredicateType) -> Result<Expr, ParseError> {

@@ -181,7 +181,27 @@ fn collect_variables<'a>(expr: &'a Expr, vars: &mut HashSet<&'a str>) {
         }
         Expr::Exists(exists) => match exists {
             gql_parser::ExistsExpr::Property(e) => collect_variables(e, vars),
-            gql_parser::ExistsExpr::Pattern(_) => {}
+            gql_parser::ExistsExpr::Pattern { paths, where_expr } => {
+                // Walk the inner pattern. Variables introduced inside the
+                // pattern but absent from the outer scope will be filtered by
+                // the caller's intersection with `known_vars` (plan.rs:30-92);
+                // returning all of them here is correct.
+                for p in paths {
+                    for el in &p.elements {
+                        if let gql_parser::PathElement::Node(n) = el {
+                            if let Some(v) = &n.variable {
+                                vars.insert(v.as_str());
+                            }
+                            if let Some(w) = &n.where_expr {
+                                collect_variables(w, vars);
+                            }
+                        }
+                    }
+                }
+                if let Some(w) = where_expr {
+                    collect_variables(w, vars);
+                }
+            }
         },
         Expr::ListComprehension {
             list_expr,

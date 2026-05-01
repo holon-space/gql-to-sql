@@ -11,6 +11,7 @@ pub enum TransformError {
     UnsupportedClause(String),
     UnsupportedExpr(String),
     Internal(String),
+    UnknownProperty { entity: String, property: String },
 }
 
 impl std::fmt::Display for TransformError {
@@ -19,6 +20,10 @@ impl std::fmt::Display for TransformError {
             TransformError::UnsupportedClause(s) => write!(f, "unsupported clause: {s}"),
             TransformError::UnsupportedExpr(s) => write!(f, "unsupported expression: {s}"),
             TransformError::Internal(s) => write!(f, "internal error: {s}"),
+            TransformError::UnknownProperty { entity, property } => write!(
+                f,
+                "unknown property '{property}' on entity '{entity}': no column mapping or extension column registered"
+            ),
         }
     }
 }
